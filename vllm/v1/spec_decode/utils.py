@@ -309,7 +309,7 @@ def extend_all_queries_by_N(
 def copy_and_expand_eagle_inputs_kernel(
     # (Padded) Inputs from the target model
     target_token_ids_ptr,  # [total_tokens_in_batch]
-    target_positions_ptr,  # [total_tokens_in_batch]
+    target_positions_ptr,  # [total_tokens_in_batch] 1-D positions (time dim for M-RoPE)
     next_token_ids_ptr,  # [num_reqs]
     # Outputs to the drafting buffers
     out_input_ids_ptr,  # [total_draft_tokens_in_batch] (output)
@@ -318,6 +318,18 @@ def copy_and_expand_eagle_inputs_kernel(
     out_is_masked_token_mask_ptr,  # [total_draft_tokens_in_batch] (output)
     out_new_token_indices_ptr,  # [num_padding_slots_per_request * num_reqs] (output)
     out_hidden_state_mapping_ptr,  # [total_tokens_in_batch]
+    # M-RoPE parameters
+    # target_mrope_positions_ptr: [3, total_input_tokens] full 3-D target positions.
+    #   Only accessed when TARGET_USES_MROPE and USES_MROPE.
+    target_mrope_positions_ptr,
+    # out_mrope_positions_ptr: [3, mrope_dst_stride] draft M-RoPE output buffer.
+    #   Only accessed when USES_MROPE.
+    out_mrope_positions_ptr,
+    mrope_src_stride,  # stride(0) of target_mrope_positions (= total_input_tokens)
+    mrope_dst_stride,  # stride(0) of out_mrope_positions   (= max_positions + 1)
+    # num_computed_per_req_ptr: [num_reqs] sequential start position per request.
+    #   Only accessed when TARGET_USES_MROPE and not USES_MROPE (cross-modal).
+    num_computed_per_req_ptr,
     # Input metadata
     query_start_loc_ptr,  # [num_reqs + 1], last value is the total num input tokens
     query_end_loc_ptr,  # [num_reqs]
@@ -327,12 +339,29 @@ def copy_and_expand_eagle_inputs_kernel(
     total_input_tokens,  # tl.int32
     num_padding_slots_per_request,  # tl.int32
     shift_input_ids,  # tl.bool
+    USES_MROPE: tl.constexpr,  # draft model uses M-RoPE
+    TARGET_USES_MROPE: tl.constexpr,  # target model uses M-RoPE
     BLOCK_SIZE_TOKENS: tl.constexpr,  # Blocks along token dim to handle prefills
 ):
     """
     Copy and expand inputs from the target model to the drafting buffers for Eagle
     speculative decoding. This kernel handles padding slots and parallel drafting
     tokens, if enabled.
+
+    When USES_MROPE / TARGET_USES_MROPE flags are set the kernel additionally
+    populates out_mrope_positions_ptr in-place, eliminating separate Python
+    pre/post-processing steps:
+
+    - TARGET_USES_MROPE and not USES_MROPE (cross-modal):
+        1-D sequential positions are derived from num_computed_per_req_ptr instead
+        of a pre-computed scatter buffer, saving one temporary allocation.
+
+    - USES_MROPE and TARGET_USES_MROPE (both M-RoPE):
+        All 3 M-RoPE dims are copied from target_mrope_positions_ptr for valid
+        tokens; the bonus token gets (last_valid_time_dim + 1) in all dims.
+
+    - USES_MROPE and not TARGET_USES_MROPE (draft M-RoPE, target 1-D):
+        The 1-D positions computed by the kernel are broadcast to all 3 dims.
     """
     request_idx = tl.program_id(axis=0)
     token_batch_idx = tl.program_id(axis=1)
@@ -396,8 +425,16 @@ def copy_and_expand_eagle_inputs_kernel(
         target_token_ids_ptr + in_idx_clamped, mask=is_valid_region & in_bounds, other=0
     )
 
-    # Load the starting position for this request (first position in the sequence)
-    start_pos = tl.load(target_positions_ptr + query_start_loc)
+    # Load the starting position for this request.
+    # Cross-modal case: target uses M-RoPE (which compresses multimodal positions)
+    # but draft uses 1-D sequential positions.  Use pre-computed num_computed values
+    # (seq_lens - extend_lens) directly, bypassing the M-RoPE position encoding.
+    if TARGET_USES_MROPE and not USES_MROPE:
+        start_pos = tl.load(num_computed_per_req_ptr + request_idx).to(tl.int64)
+    else:
+        # Standard path or both-M-RoPE: target_positions_ptr holds 1-D positions
+        # (the time dimension when target uses M-RoPE).
+        start_pos = tl.load(target_positions_ptr + query_start_loc).to(tl.int64)
 
     # Load bonus token for this request
     bonus_token = tl.load(next_token_ids_ptr + request_idx)
@@ -453,6 +490,42 @@ def copy_and_expand_eagle_inputs_kernel(
         out_idx,
         mask=is_new_token_region & in_bounds,
     )
+
+    # Populate M-RoPE positions when the draft model uses M-RoPE.
+    # This fuses what would otherwise be a separate Python post-processing step.
+    if USES_MROPE:
+        if TARGET_USES_MROPE:
+            # Both models use M-RoPE.
+            # Valid tokens: copy all 3 dims verbatim from the target positions.
+            # Bonus token: text token -> all 3 dims = (last valid time dim) + 1.
+            # Rejected / parallel-draft slots: write 0 (semantically don't-care).
+            bonus_mrope_val = (
+                tl.load(target_positions_ptr + query_end_loc) + 1
+            ).to(tl.int64)
+            for dim in range(3):
+                src_vals = tl.load(
+                    target_mrope_positions_ptr + dim * mrope_src_stride + in_idx_clamped,
+                    mask=is_valid_region & in_bounds,
+                    other=0,
+                ).to(tl.int64)
+                mrope_out = tl.where(is_bonus_region, bonus_mrope_val, src_vals)
+                mrope_out = tl.where(
+                    is_rejected_region | is_parallel_draft_region, 0, mrope_out
+                )
+                tl.store(
+                    out_mrope_positions_ptr + dim * mrope_dst_stride + out_idx,
+                    mrope_out,
+                    mask=in_bounds,
+                )
+        else:
+            # Draft uses M-RoPE, target uses 1-D positions.
+            # Broadcast the already-computed 1-D positions to all 3 M-RoPE dims.
+            for dim in range(3):
+                tl.store(
+                    out_mrope_positions_ptr + dim * mrope_dst_stride + out_idx,
+                    positions,
+                    mask=in_bounds,
+                )
 
 
 @triton.jit
