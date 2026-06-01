@@ -2434,23 +2434,45 @@ class CustomDataset(BenchmarkDataset):
         # sample() will assume this standardized format of self.data
         self.data: list[dict] = []
 
-        # Load the JSONL file
         if self.dataset_path.endswith(".jsonl"):
             jsonl_data = pd.read_json(path_or_buf=self.dataset_path, lines=True)
-
-            # check if the JSONL file has a 'prompt' column
             if "prompt" not in jsonl_data.columns:
-                raise ValueError("JSONL file must contain a 'prompt' column.")
-
-            # Convert each row to a dictionary and append to self.data
-            # This will convert the DataFrame to a list of dictionaries
-            # where each dictionary corresponds to a row in the DataFrame.
-            # This is the standardized format we want for self.data
+                if "instruction" not in jsonl_data.columns:
+                    raise ValueError(
+                        "JSONL file must contain a 'prompt' or 'instruction' column."
+                    )
+                jsonl_data["prompt"] = jsonl_data["instruction"]
             for _, row in jsonl_data.iterrows():
                 self.data.append(row.to_dict())
+        elif self.dataset_path.endswith(".json"):
+            with open(self.dataset_path, encoding="utf-8") as f:
+                raw_data = json.load(f)
+            if isinstance(raw_data, dict):
+                records = [raw_data]
+            elif isinstance(raw_data, list):
+                records = raw_data
+            else:
+                raise ValueError(
+                    "Custom JSON dataset must be a JSON object or a list of objects."
+                )
+            for index, item in enumerate(records):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "Each entry in a custom JSON dataset must be a JSON object. "
+                        f"Found {type(item)} at index {index}."
+                    )
+                if "prompt" not in item:
+                    if "instruction" not in item:
+                        raise ValueError(
+                            "Each custom JSON entry must contain 'prompt' or "
+                            f"'instruction'. Missing at index {index}."
+                        )
+                    item = dict(item)
+                    item["prompt"] = item["instruction"]
+                self.data.append(item)
         else:
             raise NotImplementedError(
-                "Only JSONL format is supported for CustomDataset."
+                "Only JSON and JSONL formats are supported for CustomDataset."
             )
 
         random.seed(self.random_seed)
