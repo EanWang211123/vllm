@@ -236,6 +236,8 @@ if TYPE_CHECKING:
     VLLM_DBO_COMM_SMS: int = 20
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
+    # Run query-len distribution overhead micro-benchmark after CUDA graph capture.
+    VLLM_BENCH_QUERY_LEN_OVERHEAD: bool = False
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
@@ -634,6 +636,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.
     "VLLM_DEBUG_DUMP_PATH": lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
+    "VLLM_BENCH_QUERY_LEN_OVERHEAD": lambda: bool(
+        int(os.getenv("VLLM_BENCH_QUERY_LEN_OVERHEAD", "0"))
+    ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.

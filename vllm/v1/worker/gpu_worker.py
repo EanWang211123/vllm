@@ -35,6 +35,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    is_global_first_rank,
 )
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
@@ -720,6 +721,13 @@ class Worker(WorkerBase):
         )
 
         activate_triton_jit_monitor()
+
+        if envs.VLLM_BENCH_QUERY_LEN_OVERHEAD and not self.use_v2_model_runner:
+            logger.info("Running post-startup query-len overhead micro-benchmark...")
+            self.model_runner.benchmark_query_len_overhead(
+                log_results=is_global_first_rank(),
+            )
+            torch.accelerator.synchronize()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

@@ -5347,6 +5347,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        query_lens: Sequence[int] | np.ndarray | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5374,6 +5375,9 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            query_lens: Optional per-request query lengths. When set, batch_size
+                is ``len(query_lens)`` and ``sum(query_lens)`` must equal
+                ``num_tokens``. Cannot be combined with ``create_mixed_batch``.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5399,36 +5403,65 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
-
-        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
-        # for dummy run with LoRA so that the num_reqs collectively
-        # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
-            assert not uniform_decode
-            # Create mixed batch:
-            # first half decode tokens, second half one prefill
-            num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
-            num_prefill_tokens = num_tokens - num_decode_tokens
-            num_reqs = num_decode_tokens + 1
-
-            # Create decode requests (1 token each) followed by prefill request
-            num_scheduled_tokens_list = [1] * num_decode_tokens + [num_prefill_tokens]
-            # Note: Overriding max_query_len to be the prefill tokens
-            max_query_len = num_prefill_tokens
-        elif uniform_decode:
-            assert not create_mixed_batch
-            num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
-            num_scheduled_tokens_list = [max_query_len] * num_reqs
-            if num_tokens % max_query_len != 0:
-                num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        per_req_seq_lens = False
+        if query_lens is not None:
+            if create_mixed_batch:
+                raise ValueError(
+                    "query_lens cannot be used with create_mixed_batch=True."
+                )
+            query_lens_list = [int(x) for x in query_lens]
+            num_reqs = len(query_lens_list)
+            if num_reqs <= 0:
+                raise ValueError("query_lens must not be empty.")
+            if num_reqs > max_num_reqs:
+                raise ValueError(
+                    f"query_lens length {num_reqs} exceeds max_num_seqs "
+                    f"{max_num_reqs}."
+                )
+            num_tokens_from_lens = sum(query_lens_list)
+            if num_tokens_from_lens != num_tokens:
+                raise ValueError(
+                    f"sum(query_lens)={num_tokens_from_lens} must equal "
+                    f"num_tokens={num_tokens}."
+                )
+            num_scheduled_tokens_list = query_lens_list
+            max_query_len = max(query_lens_list)
+            per_req_seq_lens = True
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
-            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            max_query_len = (
+                self.uniform_decode_query_len if uniform_decode else num_tokens
+            )
+
+            # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+            # for dummy run with LoRA so that the num_reqs collectively
+            # has num_tokens in total.
+            if create_mixed_batch:
+                assert not uniform_decode
+                # Create mixed batch:
+                # first half decode tokens, second half one prefill
+                num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
+                num_prefill_tokens = num_tokens - num_decode_tokens
+                num_reqs = num_decode_tokens + 1
+
+                # Create decode requests (1 token each) followed by prefill request
+                num_scheduled_tokens_list = (
+                    [1] * num_decode_tokens + [num_prefill_tokens]
+                )
+                # Note: Overriding max_query_len to be the prefill tokens
+                max_query_len = num_prefill_tokens
+            elif uniform_decode:
+                assert not create_mixed_batch
+                num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
+                num_scheduled_tokens_list = [max_query_len] * num_reqs
+                if num_tokens % max_query_len != 0:
+                    num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+            else:
+                num_reqs = min(num_tokens, max_num_reqs)
+                min_tokens_per_req = num_tokens // num_reqs
+                num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+                num_scheduled_tokens_list[-1] += num_tokens % num_reqs
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
@@ -5512,6 +5545,8 @@ class GPUModelRunner(
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
+                elif per_req_seq_lens:
+                    seq_lens = np.array(query_lens_list, dtype=np.int32)
                 elif create_mixed_batch:
                     # In the mixed batch mode (used for FI warmup), we use
                     # shorter sequence lengths to run faster.
@@ -5703,6 +5738,214 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
         return hidden_states, hidden_states[logit_indices_device]
+
+    @staticmethod
+    def _generate_random_query_lens(
+        batch_size: int,
+        total_query_tokens: int,
+        min_query_len: int,
+        max_query_len: int,
+        rng: np.random.Generator,
+    ) -> list[int]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if min_query_len <= 0 or max_query_len < min_query_len:
+            raise ValueError("Invalid query length bounds.")
+        if batch_size * min_query_len > total_query_tokens:
+            raise ValueError(
+                "total_query_tokens is too small for the given min_query_len."
+            )
+        if batch_size * max_query_len < total_query_tokens:
+            raise ValueError(
+                "total_query_tokens is too large for the given max_query_len."
+            )
+
+        query_lens = [min_query_len] * batch_size
+        remaining = total_query_tokens - batch_size * min_query_len
+        while remaining > 0:
+            req_idx = int(rng.integers(0, batch_size))
+            if query_lens[req_idx] >= max_query_len:
+                continue
+            query_lens[req_idx] += 1
+            remaining -= 1
+        assert sum(query_lens) == total_query_tokens
+        return query_lens
+
+    def dummy_run_with_query_lens(
+        self,
+        query_lens: Sequence[int] | np.ndarray,
+        *,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+        force_attention: bool = True,
+        uniform_decode: bool = False,
+        skip_eplb: bool = True,
+        remove_lora: bool = True,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a dummy forward with explicit per-request query lengths.
+
+        This is intended for micro-benchmarking PCG behavior under different
+        query-length distributions while keeping ``num_tokens`` and
+        ``batch_size`` fixed.
+        """
+        query_lens_list = [int(x) for x in query_lens]
+        num_tokens = sum(query_lens_list)
+        return self._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            force_attention=force_attention,
+            uniform_decode=uniform_decode,
+            skip_eplb=skip_eplb,
+            remove_lora=remove_lora,
+            query_lens=query_lens_list,
+            **kwargs,
+        )
+
+    def _time_dummy_run_with_query_lens(
+        self,
+        query_lens: Sequence[int],
+        num_warmup: int,
+        num_repeats: int,
+    ) -> float:
+        query_lens_list = [int(x) for x in query_lens]
+        num_tokens = sum(query_lens_list)
+        for _ in range(num_warmup):
+            self._dummy_run(
+                num_tokens,
+                query_lens=query_lens_list,
+                force_attention=True,
+                skip_eplb=True,
+                remove_lora=True,
+            )
+        torch.accelerator.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_repeats):
+            self._dummy_run(
+                num_tokens,
+                query_lens=query_lens_list,
+                force_attention=True,
+                skip_eplb=True,
+                remove_lora=True,
+            )
+        end_event.record()
+        torch.accelerator.synchronize()
+        return start_event.elapsed_time(end_event) / num_repeats
+
+    @torch.inference_mode()
+    def benchmark_query_len_overhead(
+        self,
+        batch_size: int = 32,
+        total_query_tokens: int | None = None,
+        uniform_query_len: int = 8,
+        min_query_len: int = 2,
+        max_query_len: int = 16,
+        num_random_trials: int = 5,
+        num_warmup: int = 3,
+        num_repeats: int = 20,
+        log_results: bool = True,
+    ) -> dict[str, Any]:
+        """Compare PCG dummy-run latency for uniform vs random query lengths.
+
+        All trials keep ``batch_size`` and ``total_query_tokens`` fixed while
+        varying the per-request query-length distribution.
+        """
+        if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            if log_results:
+                logger.warning(
+                    "Skipping query-len overhead benchmark: cudagraph is disabled."
+                )
+            return {}
+
+        if not self.compilation_config.cudagraph_mode.has_mode(
+            CUDAGraphMode.PIECEWISE
+        ):
+            if log_results:
+                logger.warning(
+                    "Skipping query-len overhead benchmark: PIECEWISE cudagraph "
+                    "is not enabled."
+                )
+            return {}
+
+        if total_query_tokens is None:
+            total_query_tokens = batch_size * uniform_query_len
+        if batch_size * uniform_query_len != total_query_tokens:
+            raise ValueError(
+                "uniform_query_len must divide total_query_tokens evenly when "
+                "using the default uniform baseline."
+            )
+
+        uniform_lens = [uniform_query_len] * batch_size
+        rng = np.random.default_rng(self.model_config.seed)
+        random_trials = [
+            self._generate_random_query_lens(
+                batch_size=batch_size,
+                total_query_tokens=total_query_tokens,
+                min_query_len=min_query_len,
+                max_query_len=max_query_len,
+                rng=rng,
+            )
+            for _ in range(num_random_trials)
+        ]
+
+        uniform_ms = self._time_dummy_run_with_query_lens(
+            uniform_lens,
+            num_warmup=num_warmup,
+            num_repeats=num_repeats,
+        )
+        random_ms = [
+            self._time_dummy_run_with_query_lens(
+                trial_lens,
+                num_warmup=num_warmup,
+                num_repeats=num_repeats,
+            )
+            for trial_lens in random_trials
+        ]
+
+        random_avg_ms = float(np.mean(random_ms))
+        random_std_ms = float(np.std(random_ms))
+        overhead_pct = (
+            (random_avg_ms - uniform_ms) / uniform_ms * 100.0 if uniform_ms > 0 else 0.0
+        )
+
+        results: dict[str, Any] = {
+            "batch_size": batch_size,
+            "total_query_tokens": total_query_tokens,
+            "uniform_query_len": uniform_query_len,
+            "min_query_len": min_query_len,
+            "max_query_len": max_query_len,
+            "uniform_ms": uniform_ms,
+            "random_ms": random_ms,
+            "random_avg_ms": random_avg_ms,
+            "random_std_ms": random_std_ms,
+            "overhead_pct_vs_uniform": overhead_pct,
+            "random_trials": random_trials,
+        }
+
+        if log_results:
+            logger.info(
+                "Query-len overhead benchmark (PCG dummy-run): "
+                "batch_size=%d total_tokens=%d uniform=%.3f ms "
+                "random_avg=%.3f ms (+/- %.3f ms) overhead=%.2f%%",
+                batch_size,
+                total_query_tokens,
+                uniform_ms,
+                random_avg_ms,
+                random_std_ms,
+                overhead_pct,
+            )
+            for trial_idx, (trial_lens, trial_ms) in enumerate(
+                zip(random_trials, random_ms)
+            ):
+                logger.info(
+                    "  random trial %d: %.3f ms query_lens=%s",
+                    trial_idx + 1,
+                    trial_ms,
+                    trial_lens,
+                )
+
+        return results
 
     @torch.inference_mode()
     def _dummy_sampler_run(
