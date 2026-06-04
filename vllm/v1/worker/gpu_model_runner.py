@@ -5473,6 +5473,14 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
+        if query_lens is not None:
+            # Auto-detect uniform decode from query_lens unless explicitly
+            # overridden. Passing uniform_decode=False must not force
+            # force_uniform_decode=False, which would skip the check entirely.
+            force_uniform_decode = uniform_decode if uniform_decode else None
+        else:
+            force_uniform_decode = uniform_decode
+
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -5487,7 +5495,7 @@ class GPUModelRunner(
                 # capturing mixed prefill-decode batches, we sometimes use
                 # num_tokens == num_reqs which looks like a uniform decode batch to the
                 # dispatcher; but we actually want to capture a piecewise cudagraph
-                force_uniform_decode=uniform_decode,
+                force_uniform_decode=force_uniform_decode,
                 # `force_has_lora` is used for cudagraph capture; because LoRA is
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
