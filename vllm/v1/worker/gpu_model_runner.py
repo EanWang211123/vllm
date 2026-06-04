@@ -5348,6 +5348,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         query_lens: Sequence[int] | np.ndarray | None = None,
+        log_cudagraph_dispatch: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5378,6 +5379,8 @@ class GPUModelRunner(
             query_lens: Optional per-request query lengths. When set, batch_size
                 is ``len(query_lens)`` and ``sum(query_lens)`` must equal
                 ``num_tokens``. Cannot be combined with ``create_mixed_batch``.
+            log_cudagraph_dispatch: If True, log the resolved CUDA graph runtime
+                mode (eager / pcg / fcg) at INFO level.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5502,6 +5505,25 @@ class GPUModelRunner(
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+
+        dispatch_log_msg = (
+            "dummy_run cudagraph dispatch: runtime=%s num_tokens=%d "
+            "(unpadded=%d padded=%d) num_reqs=%d max_query_len=%d "
+            "batch_descriptor=%s query_lens=%s"
+        )
+        dispatch_log_args = (
+            self._cudagraph_runtime_mode_label(cudagraph_runtime_mode),
+            batch_desc.num_tokens,
+            num_tokens_unpadded,
+            batch_desc.num_tokens,
+            num_reqs,
+            max_query_len,
+            batch_desc,
+            list(num_scheduled_tokens_list) if query_lens is not None else None,
+        )
+        logger.debug(dispatch_log_msg, *dispatch_log_args)
+        if log_cudagraph_dispatch:
+            logger.info(dispatch_log_msg, *dispatch_log_args)
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
@@ -5771,6 +5793,16 @@ class GPUModelRunner(
         assert sum(query_lens) == total_query_tokens
         return query_lens
 
+    @staticmethod
+    def _cudagraph_runtime_mode_label(mode: CUDAGraphMode) -> str:
+        if mode == CUDAGraphMode.NONE:
+            return "eager"
+        if mode == CUDAGraphMode.PIECEWISE:
+            return "pcg"
+        if mode == CUDAGraphMode.FULL:
+            return "fcg"
+        return mode.name.lower()
+
     def dummy_run_with_query_lens(
         self,
         query_lens: Sequence[int] | np.ndarray,
@@ -5780,6 +5812,7 @@ class GPUModelRunner(
         uniform_decode: bool = False,
         skip_eplb: bool = True,
         remove_lora: bool = True,
+        log_cudagraph_dispatch: bool = True,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run a dummy forward with explicit per-request query lengths.
@@ -5798,6 +5831,7 @@ class GPUModelRunner(
             skip_eplb=skip_eplb,
             remove_lora=remove_lora,
             query_lens=query_lens_list,
+            log_cudagraph_dispatch=log_cudagraph_dispatch,
             **kwargs,
         )
 
@@ -5806,16 +5840,22 @@ class GPUModelRunner(
         query_lens: Sequence[int],
         num_warmup: int,
         num_repeats: int,
+        profile_seq_lens: int | None = None,
+        log_cudagraph_dispatch: bool = True,
     ) -> float:
         query_lens_list = [int(x) for x in query_lens]
         num_tokens = sum(query_lens_list)
-        for _ in range(num_warmup):
+        for warmup_idx in range(num_warmup):
             self._dummy_run(
                 num_tokens,
                 query_lens=query_lens_list,
                 force_attention=True,
                 skip_eplb=True,
                 remove_lora=True,
+                profile_seq_lens=profile_seq_lens,
+                log_cudagraph_dispatch=(
+                    log_cudagraph_dispatch and warmup_idx == 0
+                ),
             )
         torch.accelerator.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)
@@ -5828,15 +5868,16 @@ class GPUModelRunner(
                 force_attention=True,
                 skip_eplb=True,
                 remove_lora=True,
+                profile_seq_lens=profile_seq_lens,
             )
         end_event.record()
         torch.accelerator.synchronize()
         return start_event.elapsed_time(end_event) / num_repeats
 
-    @torch.inference_mode()
-    def benchmark_query_len_overhead(
+    def _benchmark_query_len_overhead_for_batch_size(
         self,
-        batch_size: int = 32,
+        batch_size: int,
+        *,
         total_query_tokens: int | None = None,
         uniform_query_len: int = 8,
         min_query_len: int = 2,
@@ -5844,12 +5885,113 @@ class GPUModelRunner(
         num_random_trials: int = 5,
         num_warmup: int = 3,
         num_repeats: int = 20,
+        seq_len: int = 400,
         log_results: bool = True,
     ) -> dict[str, Any]:
+        if total_query_tokens is None:
+            total_query_tokens = batch_size * uniform_query_len
+        if batch_size * uniform_query_len != total_query_tokens:
+            raise ValueError(
+                f"uniform_query_len={uniform_query_len} must divide "
+                f"total_query_tokens={total_query_tokens} evenly for "
+                f"batch_size={batch_size}."
+            )
+
+        uniform_lens = [uniform_query_len] * batch_size
+        rng = np.random.default_rng(self.model_config.seed + batch_size)
+        random_trials = [
+            self._generate_random_query_lens(
+                batch_size=batch_size,
+                total_query_tokens=total_query_tokens,
+                min_query_len=min_query_len,
+                max_query_len=max_query_len,
+                rng=rng,
+            )
+            for _ in range(num_random_trials)
+        ]
+
+        uniform_ms = self._time_dummy_run_with_query_lens(
+            uniform_lens,
+            num_warmup=num_warmup,
+            num_repeats=num_repeats,
+            profile_seq_lens=seq_len,
+        )
+        random_ms = [
+            self._time_dummy_run_with_query_lens(
+                trial_lens,
+                num_warmup=num_warmup,
+                num_repeats=num_repeats,
+                profile_seq_lens=seq_len,
+            )
+            for trial_lens in random_trials
+        ]
+
+        random_avg_ms = float(np.mean(random_ms))
+        random_std_ms = float(np.std(random_ms))
+        overhead_pct = (
+            (random_avg_ms - uniform_ms) / uniform_ms * 100.0 if uniform_ms > 0 else 0.0
+        )
+
+        results: dict[str, Any] = {
+            "batch_size": batch_size,
+            "total_query_tokens": total_query_tokens,
+            "uniform_query_len": uniform_query_len,
+            "min_query_len": min_query_len,
+            "max_query_len": max_query_len,
+            "seq_len": seq_len,
+            "uniform_ms": uniform_ms,
+            "random_ms": random_ms,
+            "random_avg_ms": random_avg_ms,
+            "random_std_ms": random_std_ms,
+            "overhead_pct_vs_uniform": overhead_pct,
+            "random_trials": random_trials,
+        }
+
+        if log_results:
+            logger.info(
+                "Query-len overhead benchmark (PCG dummy-run): "
+                "batch_size=%d total_tokens=%d seq_len=%d uniform=%.3f ms "
+                "random_avg=%.3f ms (+/- %.3f ms) overhead=%.2f%%",
+                batch_size,
+                total_query_tokens,
+                seq_len,
+                uniform_ms,
+                random_avg_ms,
+                random_std_ms,
+                overhead_pct,
+            )
+            for trial_idx, (trial_lens, trial_ms) in enumerate(
+                zip(random_trials, random_ms)
+            ):
+                logger.info(
+                    "  random trial %d: %.3f ms query_lens=%s",
+                    trial_idx + 1,
+                    trial_ms,
+                    trial_lens,
+                )
+
+        return results
+
+    @torch.inference_mode()
+    def benchmark_query_len_overhead(
+        self,
+        batch_sizes: Sequence[int] | None = None,
+        total_query_tokens: int | None = None,
+        uniform_query_len: int = 8,
+        min_query_len: int = 2,
+        max_query_len: int = 16,
+        num_random_trials: int = 5,
+        num_warmup: int = 3,
+        num_repeats: int = 20,
+        seq_len: int = 400,
+        log_results: bool = True,
+    ) -> dict[int, dict[str, Any]]:
         """Compare PCG dummy-run latency for uniform vs random query lengths.
 
-        All trials keep ``batch_size`` and ``total_query_tokens`` fixed while
-        varying the per-request query-length distribution.
+        Runs the experiment for each batch size in ``batch_sizes``. All trials
+        keep ``batch_size`` and ``total_query_tokens`` fixed while varying the
+        per-request query-length distribution. Attention ``seq_lens`` are set
+        to ``seq_len`` for every request.
         """
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             if log_results:
@@ -5868,84 +6010,45 @@ class GPUModelRunner(
                 )
             return {}
 
-        if total_query_tokens is None:
-            total_query_tokens = batch_size * uniform_query_len
-        if batch_size * uniform_query_len != total_query_tokens:
-            raise ValueError(
-                "uniform_query_len must divide total_query_tokens evenly when "
-                "using the default uniform baseline."
-            )
+        if batch_sizes is None:
+            batch_sizes = [1, 4, 16, 32]
 
-        uniform_lens = [uniform_query_len] * batch_size
-        rng = np.random.default_rng(self.model_config.seed)
-        random_trials = [
-            self._generate_random_query_lens(
+        all_results: dict[int, dict[str, Any]] = {}
+        for batch_size in batch_sizes:
+            batch_total_query_tokens = (
+                batch_size * uniform_query_len
+                if total_query_tokens is None
+                else total_query_tokens
+            )
+            all_results[batch_size] = self._benchmark_query_len_overhead_for_batch_size(
                 batch_size=batch_size,
-                total_query_tokens=total_query_tokens,
+                total_query_tokens=batch_total_query_tokens,
+                uniform_query_len=uniform_query_len,
                 min_query_len=min_query_len,
                 max_query_len=max_query_len,
-                rng=rng,
-            )
-            for _ in range(num_random_trials)
-        ]
-
-        uniform_ms = self._time_dummy_run_with_query_lens(
-            uniform_lens,
-            num_warmup=num_warmup,
-            num_repeats=num_repeats,
-        )
-        random_ms = [
-            self._time_dummy_run_with_query_lens(
-                trial_lens,
+                num_random_trials=num_random_trials,
                 num_warmup=num_warmup,
                 num_repeats=num_repeats,
+                seq_len=seq_len,
+                log_results=log_results,
             )
-            for trial_lens in random_trials
-        ]
 
-        random_avg_ms = float(np.mean(random_ms))
-        random_std_ms = float(np.std(random_ms))
-        overhead_pct = (
-            (random_avg_ms - uniform_ms) / uniform_ms * 100.0 if uniform_ms > 0 else 0.0
-        )
-
-        results: dict[str, Any] = {
-            "batch_size": batch_size,
-            "total_query_tokens": total_query_tokens,
-            "uniform_query_len": uniform_query_len,
-            "min_query_len": min_query_len,
-            "max_query_len": max_query_len,
-            "uniform_ms": uniform_ms,
-            "random_ms": random_ms,
-            "random_avg_ms": random_avg_ms,
-            "random_std_ms": random_std_ms,
-            "overhead_pct_vs_uniform": overhead_pct,
-            "random_trials": random_trials,
-        }
-
-        if log_results:
+        if log_results and all_results:
             logger.info(
-                "Query-len overhead benchmark (PCG dummy-run): "
-                "batch_size=%d total_tokens=%d uniform=%.3f ms "
-                "random_avg=%.3f ms (+/- %.3f ms) overhead=%.2f%%",
-                batch_size,
-                total_query_tokens,
-                uniform_ms,
-                random_avg_ms,
-                random_std_ms,
-                overhead_pct,
+                "Query-len overhead benchmark summary (seq_len=%d):", seq_len
             )
-            for trial_idx, (trial_lens, trial_ms) in enumerate(
-                zip(random_trials, random_ms)
-            ):
+            for batch_size, result in all_results.items():
                 logger.info(
-                    "  random trial %d: %.3f ms query_lens=%s",
-                    trial_idx + 1,
-                    trial_ms,
-                    trial_lens,
+                    "  batch_size=%d total_tokens=%d uniform=%.3f ms "
+                    "random_avg=%.3f ms overhead=%.2f%%",
+                    batch_size,
+                    result["total_query_tokens"],
+                    result["uniform_ms"],
+                    result["random_avg_ms"],
+                    result["overhead_pct_vs_uniform"],
                 )
 
-        return results
+        return all_results
 
     @torch.inference_mode()
     def _dummy_sampler_run(

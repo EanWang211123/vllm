@@ -725,6 +725,9 @@ class Worker(WorkerBase):
         if envs.VLLM_BENCH_QUERY_LEN_OVERHEAD and not self.use_v2_model_runner:
             logger.info("Running post-startup query-len overhead micro-benchmark...")
             self.model_runner.benchmark_query_len_overhead(
+                batch_sizes=[1, 4, 16, 32],
+                uniform_query_len=8,
+                seq_len=400,
                 log_results=is_global_first_rank(),
             )
             torch.accelerator.synchronize()
