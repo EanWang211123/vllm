@@ -846,6 +846,7 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
         self._draft_token_req_ids: list[str] | None = None
+        self._spec_decode_batch_timing: dict[str, float | int] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -4255,6 +4256,17 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        should_time_spec_decode_verify = (
+            self.speculative_config is not None
+            and use_spec_decode
+            and get_pp_group().is_last_rank
+        )
+        should_track_spec_decode_batch_timing = (
+            self.speculative_config is not None and get_pp_group().is_last_rank
+        )
+        if should_time_spec_decode_verify:
+            torch.accelerator.synchronize()
+            verify_forward_start = time.perf_counter()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4280,6 +4292,16 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if should_track_spec_decode_batch_timing:
+            verify_forward_time_s = 0.0
+            if should_time_spec_decode_verify:
+                torch.accelerator.synchronize()
+                verify_forward_time_s = time.perf_counter() - verify_forward_start
+            self._spec_decode_batch_timing = {
+                "batch_size": num_reqs,
+                "verify_forward_time_s": verify_forward_time_s,
+                "draft_time_s": 0.0,
+            }
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4434,8 +4456,13 @@ class GPUModelRunner(
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
+        draft_time_s = 0.0
+
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal draft_time_s
             assert spec_decode_common_attn_metadata is not None
+            torch.accelerator.synchronize()
+            draft_start = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4449,6 +4476,8 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+            torch.accelerator.synchronize()
+            draft_time_s = time.perf_counter() - draft_start
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4577,6 +4606,18 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+
+        if self._spec_decode_batch_timing is not None:
+            self._spec_decode_batch_timing["draft_time_s"] = draft_time_s
+            timing = self._spec_decode_batch_timing
+            logger.info(
+                "spec_decode timing: batch_size=%d "
+                "verify_forward_ms=%.3f draft_ms=%.3f",
+                timing["batch_size"],
+                timing["verify_forward_time_s"] * 1000,
+                timing["draft_time_s"] * 1000,
+            )
+            self._spec_decode_batch_timing = None
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
