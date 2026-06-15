@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
+import inspect
 from typing import Any, cast
 
 import numpy as np
@@ -403,8 +404,18 @@ class SpecDecodeBaseProposer:
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            get_top = self.model.get_top_tokens
+            spec_step_idx = getattr(self, "_draft_spec_step_idx", 0)
+            if "spec_step_idx" in inspect.signature(get_top).parameters:
+                return get_top(hidden_states, spec_step_idx=spec_step_idx)
+            return get_top(hidden_states)
+        compute = self.model.compute_logits
+        spec_step_idx = getattr(self, "_draft_spec_step_idx", 0)
+        if "spec_step_idx" in inspect.signature(compute).parameters:
+            logits = compute(hidden_states, spec_step_idx=spec_step_idx)
+        else:
+            logits = compute(hidden_states)
+        return logits.argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -491,6 +502,7 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        self._draft_spec_step_idx = 0
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.
@@ -590,6 +602,7 @@ class SpecDecodeBaseProposer:
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
+            self._draft_spec_step_idx = token_index + 1
 
             if not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(

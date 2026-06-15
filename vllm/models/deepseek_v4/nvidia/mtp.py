@@ -226,11 +226,11 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
-    def compute_logits(
+    def _prepare_logits_inputs(
         self,
         hidden_states: torch.Tensor,
-        spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+        spec_step_idx: int,
+    ) -> tuple[torch.Tensor, nn.Module]:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         # MTP forward returns the pre-hc_head residual (T, hc_mult * D); apply
@@ -251,8 +251,28 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             mtp_layer.shared_head.norm.weight.data,
             mtp_layer.shared_head.norm.variance_epsilon,
         )
-        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
-        return logits
+        return hidden_states, mtp_layer.shared_head.head
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        hidden_states, lm_head = self._prepare_logits_inputs(
+            hidden_states, spec_step_idx
+        )
+        return self.logits_processor(lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax with hc_head + per-step shared_head."""
+        hidden_states, lm_head = self._prepare_logits_inputs(
+            hidden_states, spec_step_idx
+        )
+        return self.logits_processor.get_top_tokens(lm_head, hidden_states)
 
 
 class DeepSeekV4MTP(nn.Module):
@@ -287,6 +307,13 @@ class DeepSeekV4MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Weight name remapping for checkpoint compatibility.
