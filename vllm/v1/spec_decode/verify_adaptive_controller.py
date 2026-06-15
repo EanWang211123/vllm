@@ -1,19 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
 import bisect
+import json
 import math
+import os
+from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.verify_adaptive_config import VerifyAdaptiveConfig
 
 logger = init_logger(__name__)
+
+_Q_SLOT_STATS_DEFAULT_FILENAME = "adaptive_verify_q_slot_stats.json"
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +98,83 @@ def choose_query_lens_discrete(
 
 
 # ---------------------------------------------------------------------------
+# Q-slot hit statistics (optional, env-gated)
+# ---------------------------------------------------------------------------
+
+def resolve_q_slot_stats_output_path(raw_path: str) -> str:
+    """Resolve env path to a concrete JSON file path."""
+    if raw_path.endswith(".json"):
+        return raw_path
+    return os.path.join(raw_path, _Q_SLOT_STATS_DEFAULT_FILENAME)
+
+
+def build_q_slot_stats_report(
+    hit_counts: dict[int, dict[int, int]],
+    ql_levels: list[int],
+) -> dict[str, Any]:
+    """Build the JSON-serialisable q-slot hit distribution report."""
+    batch_sizes: dict[str, Any] = {}
+    for bs_key in sorted(hit_counts):
+        counts = hit_counts[bs_key]
+        total = sum(counts.values())
+        known_levels = sorted(set(ql_levels) | set(counts))
+        slots = []
+        for ql in known_levels:
+            count = counts.get(ql, 0)
+            slots.append(
+                {
+                    "query_len_per_req": ql,
+                    "count": count,
+                    "probability": (count / total) if total else 0.0,
+                }
+            )
+        batch_sizes[str(bs_key)] = {
+            "bs_key": bs_key,
+            "total_decisions": total,
+            "q_slots": slots,
+        }
+    return {"version": 1, "batch_sizes": batch_sizes}
+
+
+class AdaptiveVerifyQSlotStatsCollector:
+    """Track per-request query_len_per_req hits per batch-size key."""
+
+    def __init__(self, output_path: str) -> None:
+        self.output_path = resolve_q_slot_stats_output_path(output_path)
+        self._hit_counts: dict[int, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+    def record(self, bs_key: int, draft_lens: list[int]) -> None:
+        for draft_len in draft_lens:
+            self._hit_counts[bs_key][draft_len + 1] += 1
+
+    def flush(self, ql_levels: list[int]) -> None:
+        if not self._hit_counts:
+            return
+        report = build_q_slot_stats_report(self._hit_counts, ql_levels)
+        parent = os.path.dirname(self.output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{self.output_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, self.output_path)
+        logger.info(
+            "Adaptive verify q-slot stats written to %s (%d batch-size keys).",
+            self.output_path,
+            len(report["batch_sizes"]),
+        )
+
+
+def _is_q_slot_stats_collector_rank() -> bool:
+    return (
+        get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank
+    )
+
+
+# ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
 
@@ -132,6 +216,17 @@ class VerifyAdaptiveController:
 
         # req_id → recommended draft_len for the next verifier step
         self._adaptive_draft_lens: dict[str, int] = {}
+
+        self._q_slot_stats: AdaptiveVerifyQSlotStatsCollector | None = None
+        stats_path = envs.VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH
+        if stats_path and _is_q_slot_stats_collector_rank():
+            self._q_slot_stats = AdaptiveVerifyQSlotStatsCollector(stats_path)
+            atexit.register(self.flush_q_slot_stats)
+            logger.info(
+                "Adaptive verify q-slot stats collection enabled; "
+                "output=%s",
+                self._q_slot_stats.output_path,
+            )
 
         if get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank:
             logger.info(
@@ -279,6 +374,9 @@ class VerifyAdaptiveController:
         for req_id, draft_len in zip(active_req_ids, draft_lens):
             self._adaptive_draft_lens[req_id] = draft_len
 
+        if self._q_slot_stats is not None:
+            self._q_slot_stats.record(bs_key, draft_lens)
+
         logger.debug(
             "adaptive: bs_key=%d best_Q=%d best_S=%d score=%.4f draft_lens=%s",
             bs_key, result["best_Q"], result["best_S"],
@@ -292,6 +390,11 @@ class VerifyAdaptiveController:
     def invalidate(self, req_id: str) -> None:
         """Drop cached state for a completed or evicted request."""
         self._adaptive_draft_lens.pop(req_id, None)
+
+    def flush_q_slot_stats(self) -> None:
+        """Write q-slot hit statistics to disk if collection is enabled."""
+        if self._q_slot_stats is not None:
+            self._q_slot_stats.flush(self._query_len_levels)
 
 
 # ---------------------------------------------------------------------------

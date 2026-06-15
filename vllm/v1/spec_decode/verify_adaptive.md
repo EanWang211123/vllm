@@ -29,6 +29,40 @@ vllm serve ... \
 - Example JSON: `verify_adaptive_config.example.json` in this directory.
 - Field reference: `VerifyAdaptiveConfig` in `verify_adaptive_config.py`.
 
+### Q-slot hit statistics (optional)
+
+Set `VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH` to record how often each
+profiled `query_len_per_req` slot is assigned per active request, grouped
+by batch-size key (`bs_key`).  On worker shutdown the report is written as
+JSON.
+
+```bash
+export VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH=/tmp/adaptive_q_slot_stats.json
+# or a directory (writes adaptive_verify_q_slot_stats.json inside):
+export VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH=/tmp/adaptive_stats/
+```
+
+Only TP rank 0 on the first PP stage collects stats (one file per model
+replica).  Example output shape:
+
+```json
+{
+  "version": 1,
+  "batch_sizes": {
+    "32": {
+      "bs_key": 32,
+      "total_decisions": 1000,
+      "q_slots": [
+        {"query_len_per_req": 2, "count": 120, "probability": 0.12},
+        {"query_len_per_req": 4, "count": 380, "probability": 0.38}
+      ]
+    }
+  }
+}
+```
+
+Unvisited q-slots appear with `"count": 0` and `"probability": 0.0`.
+
 ## Runtime flow
 
 ```text

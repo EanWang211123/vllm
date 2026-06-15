@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     VLLM_DBO_COMM_SMS: int = 20
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
+    VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
@@ -729,6 +730,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.
     "VLLM_DEBUG_DUMP_PATH": lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
+    # When set, adaptive-verify records per-batch-size q-slot hit stats and
+    # writes them to this JSON file path (or <dir>/adaptive_verify_q_slot_stats.json).
+    "VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH": lambda: os.environ.get(
+        "VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH", None
+    ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.
@@ -2100,6 +2106,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_ADAPTIVE_VERIFY_Q_SLOT_STATS_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",

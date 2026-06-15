@@ -6432,6 +6432,9 @@ class GPUModelRunner(
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self._verify_adaptive_controller is not None:
+            self._verify_adaptive_controller.flush_q_slot_stats()
+
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
