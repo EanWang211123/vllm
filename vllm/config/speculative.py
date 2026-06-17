@@ -271,11 +271,14 @@ class SpeculativeConfig:
     usage."""
 
     speculative_adaptive_verify_config: str | None = None
-    """Path to a JSON file for :class:`~vllm.v1.spec_decode.verify_adaptive_config.
-    VerifyAdaptiveConfig`.  Enables adaptive verifier query lengths for parallel
-    speculative decoding (DFlash, PARD).  Also settable via
-    ``--speculative-adaptive-verify-config`` or the
-    ``speculative_adaptive_verify_config`` key inside ``--speculative-config``."""
+    """JSON **string** (not a file path) configuring
+    :class:`~vllm.v1.spec_decode.verify_adaptive_config.VerifyAdaptiveConfig`.
+    Enables adaptive verifier query lengths for parallel speculative decoding
+    (DFlash, PARD).  Prefer the dedicated ``--adaptive-verify-config`` CLI flag
+    which accepts the JSON string directly; the legacy
+    ``--speculative-adaptive-verify-config`` flag (file path) is still accepted
+    for backwards compatibility and is resolved to this field before engine
+    creation."""
 
     def compute_hash(self) -> str:
         """

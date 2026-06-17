@@ -621,27 +621,27 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
-        # VerifyAdaptiveController — enabled via
-        # --speculative-adaptive-verify-config (path to JSON).
+        # VerifyAdaptiveController — enabled via --adaptive-verify-config
+        # (JSON string) or the legacy --speculative-adaptive-verify-config.
         self._verify_adaptive_controller: VerifyAdaptiveController | None = None
-        _adaptive_cfg_path = (
+        _adaptive_cfg_str = (
             self.speculative_config.speculative_adaptive_verify_config
             if self.speculative_config is not None
             else None
         )
-        if _adaptive_cfg_path:
+        if _adaptive_cfg_str:
             if (
                 self.speculative_config is None
                 or not self.speculative_config.supports_adaptive_verify()
             ):
                 logger.warning(
-                    "speculative_adaptive_verify_config is set but speculative "
-                    "method does not support adaptive verifier step-length "
+                    "adaptive_verify_config is set but the speculative method "
+                    "does not support adaptive verifier step-length "
                     "(requires dflash or draft_model with parallel_drafting); "
                     "adaptive verify is disabled."
                 )
             else:
-                _acfg = VerifyAdaptiveConfig.from_json(_adaptive_cfg_path)
+                _acfg = VerifyAdaptiveConfig.from_json_str(_adaptive_cfg_str)
                 self._verify_adaptive_controller = VerifyAdaptiveController(
                     config=_acfg,
                     num_spec_tokens=self.speculative_config.num_speculative_tokens,

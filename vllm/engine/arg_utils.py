@@ -618,6 +618,7 @@ class EngineArgs:
     spec_model: str | None = None
     spec_tokens: int | None = None
     speculative_adaptive_verify_config: str | None = None
+    adaptive_verify_config: str | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -1494,6 +1495,19 @@ class EngineArgs:
             **speculative_kwargs["speculative_adaptive_verify_config"],
         )
         vllm_group.add_argument(
+            "--adaptive-verify-config",
+            type=str,
+            default=None,
+            help=(
+                "JSON string configuring the adaptive verifier step-length "
+                "controller for parallel speculative decoding (DFlash, PARD). "
+                "Providing this flag enables the feature. "
+                "Example: '{\"warmup_seq_lens\": 512, \"n_measure_iters\": 10}'. "
+                "Mutually exclusive with "
+                "--speculative-config['speculative_adaptive_verify_config']."
+            ),
+        )
+        vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
@@ -1689,12 +1703,23 @@ class EngineArgs:
         """Initializes and returns a SpeculativeConfig object based on
         `speculative_config`.
         """
+        # --adaptive-verify-config accepts a JSON string directly and maps to
+        # the same speculative_config key as the legacy file-path arg.
+        # The two are mutually exclusive.
+        if self.adaptive_verify_config is not None:
+            if self.speculative_adaptive_verify_config is not None:
+                raise ValueError(
+                    "--adaptive-verify-config and "
+                    "--speculative-adaptive-verify-config are mutually exclusive."
+                )
+            self.speculative_adaptive_verify_config = self.adaptive_verify_config
+
         for flag, key, value in (
             ("--spec-method", "method", self.spec_method),
             ("--spec-model", "model", self.spec_model),
             ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
             (
-                "--speculative-adaptive-verify-config",
+                "--adaptive-verify-config / --speculative-adaptive-verify-config",
                 "speculative_adaptive_verify_config",
                 self.speculative_adaptive_verify_config,
             ),

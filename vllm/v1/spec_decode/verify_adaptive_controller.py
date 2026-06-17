@@ -122,8 +122,13 @@ class VerifyAdaptiveController:
             else num_spec_tokens + 1
         )
 
-        self._batch_size_levels: list[int] = self._build_batch_size_levels()
+        # query-length levels are known at init time (only depend on config /
+        # num_spec_tokens).
         self._query_len_levels: list[int] = self._build_query_len_levels()
+
+        # batch-size levels require the runner's CUDA-graph capture sizes,
+        # so they are built lazily inside profile_cost_table().
+        self._batch_size_levels: list[int] = []
 
         # (batch_size, sum_query_len) → ITL in seconds
         self._cost_table: dict[tuple[int, int], float] = {}
@@ -135,55 +140,101 @@ class VerifyAdaptiveController:
 
         if get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank:
             logger.info(
-                "VerifyAdaptiveController: bs_levels=%s  ql_levels=%s",
-                self._batch_size_levels,
+                "VerifyAdaptiveController: ql_levels=%s  "
+                "(bs_levels will be built from CUDA-graph sizes at profiling time)",
                 self._query_len_levels,
             )
 
-    def _build_batch_size_levels(self) -> list[int]:
-        """Step-2 range from min_warmup_batch_size to cap."""
-        if self.config.warmup_batch_sizes:
+    # -----------------------------------------------------------------------
+    # Level builders
+    # -----------------------------------------------------------------------
+
+    def _build_batch_size_levels(
+        self, cuda_graph_sizes: list[int]
+    ) -> list[int]:
+        """Return the batch-size levels to profile.
+
+        When ``config.warmup_batch_sizes`` is ``None``, the CUDA-graph capture
+        sizes supplied by the runner are used, optionally clamped to
+        [``min_warmup_batch_size``, ``max_warmup_batch_size``].
+        When an explicit list is provided it is used as-is (no clamping).
+        """
+        if self.config.warmup_batch_sizes is not None:
             return sorted(set(self.config.warmup_batch_sizes))
-        cap = (
-            self.config.max_warmup_batch_size
-            if self.config.max_warmup_batch_size is not None
-            else self.max_batch_size
-        )
-        start = self.config.min_warmup_batch_size
-        levels = list(range(start, cap + 1, 2))
-        if not levels or levels[-1] < cap:
-            levels.append(cap)
+
+        levels = sorted(set(cuda_graph_sizes))
+
+        lo = self.config.min_warmup_batch_size
+        hi = self.config.max_warmup_batch_size
+        if lo is not None:
+            levels = [bs for bs in levels if bs >= lo]
+        if hi is not None:
+            levels = [bs for bs in levels if bs <= hi]
         return levels
 
     def _build_query_len_levels(self) -> list[int]:
-        """``{min_q, min_q+step, …, max_q}`` with max_q forced in."""
-        min_q = self.config.min_query_len_per_req
+        """Return the query-length levels to profile.
+
+        If ``config.query_len_list`` is set it is used directly (de-duped,
+        sorted).  Otherwise a stepped range is auto-generated:
+
+        * Level ``1`` (anchor-only, zero draft tokens) is **always** included.
+        * Stepped values: ``range(max(2, min_q), max_q + 1, step)``
+          (i.e. the stepped part starts from at least 2 so it doesn't
+          overlap with the always-included ``1``).
+        * ``max_q`` is force-included even if not hit by the step.
+        * The final list is filtered to ``{1} ∪ [min_q, max_q]``.
+        """
+        if self.config.query_len_list is not None:
+            return sorted(set(self.config.query_len_list))
+
         max_q = self.max_query_len_per_req
         step = self.config.query_len_step_per_req
+        min_q = self.config.min_query_len_per_req
 
-        levels = list(range(min_q, max_q + 1, step))
-        if not levels or levels[-1] < max_q:
-            levels.append(max_q)
-        return sorted(set(levels))
+        stepped_start = max(2, min_q)
+        levels_set: set[int] = {1}                          # anchor baseline
+        levels_set.update(range(stepped_start, max_q + 1, step))
+        levels_set.add(max_q)                               # force-include cap
+
+        # Keep 1 always; keep others in [min_q, max_q].
+        return sorted(
+            q for q in levels_set if q == 1 or (min_q <= q <= max_q)
+        )
+
+    # -----------------------------------------------------------------------
+    # Profiling
+    # -----------------------------------------------------------------------
 
     def profile_cost_table(self, runner: Any) -> None:
         """Measure verifier ITL at each (batch_size, query_len_per_req) point.
 
-        INTEGRATION NOTE: ``runner._dummy_run`` must accept the kwarg
-        ``explicit_scheduled_tokens: list[int] | None``.  When set it
-        bypasses the internal token-distribution logic (see model-runner
-        integration step).
+        Must be called after CUDA-graph capture / JIT warmup completes so
+        that timings reflect real post-compilation latency.
         """
-        if not self.config.enabled:
+        cuda_graph_sizes: list[int] = getattr(
+            runner, "cudagraph_batch_sizes", []
+        )
+        self._batch_size_levels = self._build_batch_size_levels(cuda_graph_sizes)
+
+        if not self._batch_size_levels:
+            logger.warning(
+                "VerifyAdaptiveController: no batch-size levels after filtering "
+                "(cuda_graph_sizes=%s, min=%s, max=%s); profiling skipped.",
+                cuda_graph_sizes,
+                self.config.min_warmup_batch_size,
+                self.config.max_warmup_batch_size,
+            )
             return
 
         if get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank:
             logger.info(
                 "VerifyAdaptiveController: profiling %d ITL cost points "
-                "(%d bs × %d ql).",
+                "(%d bs × %d ql).  bs_levels=%s",
                 len(self._batch_size_levels) * len(self._query_len_levels),
                 len(self._batch_size_levels),
                 len(self._query_len_levels),
+                self._batch_size_levels,
             )
 
         max_tokens = getattr(runner, "max_num_tokens", None)
@@ -242,6 +293,10 @@ class VerifyAdaptiveController:
                 len(self._cost_table),
             )
 
+    # -----------------------------------------------------------------------
+    # Per-step decision
+    # -----------------------------------------------------------------------
+
     def process_draft_output(
         self,
         selected_probs: torch.Tensor,  # [B, T] on CPU (pinned), already transferred
@@ -250,7 +305,7 @@ class VerifyAdaptiveController:
         batch_size: int,
     ) -> None:
         """Compute and cache adaptive draft_lens from this step's drafter probs."""
-        if not self.config.enabled or not active_draft_req_ids or not self._sorted_bs:
+        if not active_draft_req_ids or not self._sorted_bs:
             return
 
         n_rows = min(selected_probs.shape[0], len(req_ids), batch_size)
