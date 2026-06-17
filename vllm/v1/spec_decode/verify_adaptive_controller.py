@@ -15,6 +15,8 @@ from vllm.v1.spec_decode.verify_adaptive_config import VerifyAdaptiveConfig
 
 logger = init_logger(__name__)
 
+_DEFAULT_MAX_WARMUP_BATCH_SIZE = 32
+
 
 # ---------------------------------------------------------------------------
 # Core algorithm — pure function, stateless, unit-testable independently.
@@ -149,6 +151,12 @@ class VerifyAdaptiveController:
     # Level builders
     # -----------------------------------------------------------------------
 
+    def _effective_max_warmup_batch_size(self) -> int:
+        """Upper batch-size cap when auto-building levels from CUDA-graph sizes."""
+        if self.config.max_warmup_batch_size is not None:
+            return self.config.max_warmup_batch_size
+        return min(_DEFAULT_MAX_WARMUP_BATCH_SIZE, self.max_batch_size)
+
     def _build_batch_size_levels(
         self, cuda_graph_sizes: list[int]
     ) -> list[int]:
@@ -156,7 +164,9 @@ class VerifyAdaptiveController:
 
         When ``config.warmup_batch_sizes`` is ``None``, the CUDA-graph capture
         sizes supplied by the runner are used, optionally clamped to
-        [``min_warmup_batch_size``, ``max_warmup_batch_size``].
+        [``min_warmup_batch_size``, ``max_warmup_batch_size``].  When
+        ``max_warmup_batch_size`` is unset the upper bound defaults to
+        ``min(32, max_num_seqs)``.
         When an explicit list is provided it is used as-is (no clamping).
         """
         if self.config.warmup_batch_sizes is not None:
@@ -165,11 +175,10 @@ class VerifyAdaptiveController:
         levels = sorted(set(cuda_graph_sizes))
 
         lo = self.config.min_warmup_batch_size
-        hi = self.config.max_warmup_batch_size
+        hi = self._effective_max_warmup_batch_size()
         if lo is not None:
             levels = [bs for bs in levels if bs >= lo]
-        if hi is not None:
-            levels = [bs for bs in levels if bs <= hi]
+        levels = [bs for bs in levels if bs <= hi]
         return levels
 
     def _build_query_len_levels(self) -> list[int]:
@@ -230,11 +239,12 @@ class VerifyAdaptiveController:
         if get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank:
             logger.info(
                 "VerifyAdaptiveController: profiling %d ITL cost points "
-                "(%d bs × %d ql).  bs_levels=%s",
+                "(%d bs × %d ql).  bs_levels=%s  max_warmup_bs=%d",
                 len(self._batch_size_levels) * len(self._query_len_levels),
                 len(self._batch_size_levels),
                 len(self._query_len_levels),
                 self._batch_size_levels,
+                self._effective_max_warmup_batch_size(),
             )
 
         max_tokens = getattr(runner, "max_num_tokens", None)

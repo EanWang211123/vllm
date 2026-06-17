@@ -61,8 +61,9 @@ sum_query_len = Σ_i query_lens[i] = B + Σ_i draft_lens[i]
 After JIT / CUDA-graph warmup (`compile_or_warm_up_model`), `_adaptive_profile_run` fills
 `cost_table[(bs, bs * ql)]` at discrete points:
 
-- **Batch axis**: explicit `warmup_batch_sizes`, or step-2 from
-  `min_warmup_batch_size` to `max_warmup_batch_size`.
+- **Batch axis**: explicit `warmup_batch_sizes`, or CUDA-graph capture sizes
+  filtered by `min_warmup_batch_size` / `max_warmup_batch_size` (default cap:
+  `min(32, max_num_seqs)`).
 - **Per-request query_len axis**: from `min_query_len_per_req` in steps of
   `query_len_step_per_req`, capped at `max_query_len_per_req` (default:
   `num_speculative_tokens + 1`).

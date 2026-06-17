@@ -27,8 +27,8 @@ class VerifyAdaptiveConfig:
 
     warmup_batch_sizes: Optional[list[int]] = None
     """Explicit batch-size levels to profile.  ``None`` (default) → use the
-    engine's full CUDA-graph capture-size list, optionally clamped by
-    *min_warmup_batch_size* / *max_warmup_batch_size*."""
+    engine's CUDA-graph capture-size list, clamped by *min_warmup_batch_size*
+    and *max_warmup_batch_size* (default cap: ``min(32, max_num_seqs)``)."""
 
     min_warmup_batch_size: Optional[int] = None
     """When *warmup_batch_sizes* is ``None``, drop CUDA-graph sizes below
@@ -36,7 +36,7 @@ class VerifyAdaptiveConfig:
 
     max_warmup_batch_size: Optional[int] = None
     """When *warmup_batch_sizes* is ``None``, drop CUDA-graph sizes above
-    this threshold.  ``None`` → no upper bound."""
+    this threshold.  ``None`` → ``min(32, max_num_seqs)``."""
 
     # -----------------------------------------------------------------------
     # Query-length axis
