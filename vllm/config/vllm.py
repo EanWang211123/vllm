@@ -2050,6 +2050,11 @@ class VllmConfig:
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
 
+            # Adaptive verifier step-length is only implemented in the V1
+            # model runner (gpu_model_runner.py).
+            if speculative_config.speculative_adaptive_verify_config is not None:
+                unsupported.append("adaptive verifier step-length")
+
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 
