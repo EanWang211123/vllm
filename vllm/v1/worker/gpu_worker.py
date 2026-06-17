@@ -737,7 +737,9 @@ class Worker(WorkerBase):
             activate as activate_triton_jit_monitor,
         )
 
-        activate_triton_jit_monitor()
+        activate_triton_jit_monitor(
+            verbose=self.observability_config.jit_monitor_verbose
+        )
 
         # Profile verifier ITL cost table after all JIT warmup is complete
         # so that measured latency reflects real post-compilation performance.
