@@ -13,20 +13,22 @@ vllm serve <target_model> \
   --spec-method dflash \
   --spec-model <dflash_draft_model> \
   --spec-tokens 15 \
-  --speculative-adaptive-verify-config /path/to/verify_adaptive_config.json
+  --adaptive-verify-config '{}'
 ```
 
 Equivalent via the speculative JSON blob:
 
 ```bash
 vllm serve ... \
-  --speculative-config '{"method":"dflash","model":"...","num_speculative_tokens":15,"speculative_adaptive_verify_config":"/path/to/config.json"}'
+  --speculative-config '{"method":"dflash","model":"...","num_speculative_tokens":15,"speculative_adaptive_verify_config":"{}"}'
 ```
 
 - The controller is only constructed for parallel speculative methods:
   `method=dflash`, or `method=draft_model` with `parallel_drafting=true`
-  (PARD). Other spec methods log a warning and ignore the path.
-- Example JSON: `verify_adaptive_config.example.json` in this directory.
+  (PARD). Other spec methods log a warning and ignore the config.
+- Adaptive verify is only implemented in the **V1 model runner**.  Providing
+  the config automatically falls back to V1; setting
+  ``VLLM_USE_V2_MODEL_RUNNER=1`` together with this config raises an error.
 - Field reference: `VerifyAdaptiveConfig` in `verify_adaptive_config.py`.
 
 ## Runtime flow
