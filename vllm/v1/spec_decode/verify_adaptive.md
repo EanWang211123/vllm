@@ -71,6 +71,20 @@ After JIT / CUDA-graph warmup (`compile_or_warm_up_model`), `_adaptive_profile_r
   Set this to a value representative of your production sequence length so
   that FlashAttention kernel cost is realistic during profiling.
 
+## Low-concurrency fast path
+
+When ``min_warmup_batch_size`` is set and the live batch is smaller, adaptive
+verify is bypassed for that step:
+
+- No ``selected_probs`` gather in the drafter (avoids extra GPU work).
+- No async D2H / CPU sync for prob observation.
+- No verifier draft truncation; full ``num_speculative_tokens`` are checked.
+- Any stale per-request ``draft_len`` cache is cleared so a later high-batch
+  step does not inherit outdated truncation.
+
+Set ``min_warmup_batch_size`` to the smallest batch size you profiled (e.g.
+the minimum CUDA-graph capture size you kept after filtering).
+
 ## Core algorithm (each decode step)
 
 **Inputs**

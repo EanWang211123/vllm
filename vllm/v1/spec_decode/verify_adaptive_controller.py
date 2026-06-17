@@ -307,6 +307,22 @@ class VerifyAdaptiveController:
     # Per-step decision
     # -----------------------------------------------------------------------
 
+    def should_adapt(self, batch_size: int) -> bool:
+        """Whether adaptive draft-length selection should run for *batch_size*.
+
+        When ``min_warmup_batch_size`` is set and the live batch is smaller,
+        the prob-observation / D2H-sync path is skipped and the verifier
+        keeps the default full draft length (no truncation).
+        """
+        lo = self.config.min_warmup_batch_size
+        if lo is not None and batch_size < lo:
+            return False
+        return bool(self._sorted_bs)
+
+    def clear_cached_draft_lens(self) -> None:
+        """Drop per-request draft_len cache (e.g. after a fast-path step)."""
+        self._adaptive_draft_lens.clear()
+
     def process_draft_output(
         self,
         selected_probs: torch.Tensor,  # [B, T] on CPU (pinned), already transferred
@@ -315,6 +331,8 @@ class VerifyAdaptiveController:
         batch_size: int,
     ) -> None:
         """Compute and cache adaptive draft_lens from this step's drafter probs."""
+        if not self.should_adapt(batch_size):
+            return
         if not active_draft_req_ids or not self._sorted_bs:
             return
 

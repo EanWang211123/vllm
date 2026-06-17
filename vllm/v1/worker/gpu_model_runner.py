@@ -648,11 +648,6 @@ class GPUModelRunner(
                     max_batch_size=self.scheduler_config.max_num_seqs,
                     device=self.device,
                 )
-                # Enable prob computation in the drafter even for greedy sampling.
-                if hasattr(self, "drafter") and hasattr(
-                    self.drafter, "needs_draft_probs"
-                ):
-                    self.drafter.needs_draft_probs = True
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
@@ -4126,34 +4121,40 @@ class GPUModelRunner(
 
         # Adaptive spec-length truncation: apply draft_lens cached by the
         # previous step's _maybe_process_adaptive_probs call.
+        _adaptive_ctrl = self._verify_adaptive_controller
         if (
-            self._verify_adaptive_controller is not None
+            _adaptive_ctrl is not None
             and scheduler_output.scheduled_spec_decode_tokens
         ):
-            new_spec = scheduler_output.scheduled_spec_decode_tokens.copy()
-            new_num_sched = scheduler_output.num_scheduled_tokens.copy()
-            tokens_delta = 0
-            for req_id, draft_toks in list(new_spec.items()):
-                adaptive_len = (
-                    self._verify_adaptive_controller.get_adaptive_draft_len(req_id)
-                )
-                if adaptive_len is not None and adaptive_len < len(draft_toks):
-                    diff = len(draft_toks) - adaptive_len
-                    tokens_delta += diff
-                    new_num_sched[req_id] -= diff
-                    if adaptive_len == 0:
-                        del new_spec[req_id]
-                    else:
-                        new_spec[req_id] = draft_toks[:adaptive_len]
-            if tokens_delta > 0:
-                scheduler_output = replace(
-                    scheduler_output,
-                    scheduled_spec_decode_tokens=new_spec,
-                    num_scheduled_tokens=new_num_sched,
-                    total_num_scheduled_tokens=(
-                        scheduler_output.total_num_scheduled_tokens - tokens_delta
-                    ),
-                )
+            batch_size = len(scheduler_output.num_scheduled_tokens)
+            if _adaptive_ctrl.should_adapt(batch_size):
+                new_spec = scheduler_output.scheduled_spec_decode_tokens.copy()
+                new_num_sched = scheduler_output.num_scheduled_tokens.copy()
+                tokens_delta = 0
+                for req_id, draft_toks in list(new_spec.items()):
+                    adaptive_len = _adaptive_ctrl.get_adaptive_draft_len(req_id)
+                    if adaptive_len is not None and adaptive_len < len(draft_toks):
+                        diff = len(draft_toks) - adaptive_len
+                        tokens_delta += diff
+                        new_num_sched[req_id] -= diff
+                        if adaptive_len == 0:
+                            del new_spec[req_id]
+                        else:
+                            new_spec[req_id] = draft_toks[:adaptive_len]
+                if tokens_delta > 0:
+                    scheduler_output = replace(
+                        scheduler_output,
+                        scheduled_spec_decode_tokens=new_spec,
+                        num_scheduled_tokens=new_num_sched,
+                        total_num_scheduled_tokens=(
+                            scheduler_output.total_num_scheduled_tokens
+                            - tokens_delta
+                        ),
+                    )
+            else:
+                # Fast path: stale cached draft_lens must not affect the next
+                # high-batch step after a low-concurrency interval.
+                _adaptive_ctrl.clear_cached_draft_lens()
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -4828,8 +4829,14 @@ class GPUModelRunner(
         # Queue selected_probs D2H on the default stream (drafter runs there
         # too, so no wait_stream needed).  _bookkeeping_sync's parse_output
         # does .cpu() which syncs the default stream, covering this copy.
+        _adaptive_ctrl = self._verify_adaptive_controller
+        _adapt_batch = (
+            _adaptive_ctrl is not None
+            and _adaptive_ctrl.should_adapt(self.input_batch.num_reqs)
+        )
         if (
-            not zeros_only
+            _adapt_batch
+            and not zeros_only
             and not self._adaptive_probs_pending
             and self._adaptive_probs_pinned is not None
             and self._adaptive_probs_event is not None
@@ -5011,6 +5018,14 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         assert spec_config is not None
         num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
+        if self._verify_adaptive_controller is not None and hasattr(
+            self.drafter, "needs_draft_probs"
+        ):
+            self.drafter.needs_draft_probs = (
+                self._verify_adaptive_controller.should_adapt(
+                    self.input_batch.num_reqs
+                )
+            )
         self._draft_probs = None
         self._draft_prob_req_ids = None
         if spec_config.method == "ngram":

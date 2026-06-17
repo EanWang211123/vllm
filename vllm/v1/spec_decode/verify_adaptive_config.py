@@ -32,7 +32,11 @@ class VerifyAdaptiveConfig:
 
     min_warmup_batch_size: Optional[int] = None
     """When *warmup_batch_sizes* is ``None``, drop CUDA-graph sizes below
-    this threshold.  ``None`` → no lower bound."""
+    this threshold.  ``None`` → no lower bound.
+
+    At runtime, batches smaller than this value skip adaptive draft-length
+    selection (no prob observation / D2H sync) and use the default full
+    verifier draft length."""
 
     max_warmup_batch_size: Optional[int] = None
     """When *warmup_batch_sizes* is ``None``, drop CUDA-graph sizes above
