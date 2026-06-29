@@ -1478,7 +1478,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with record_function_or_nullcontext(
-                f"vllm:v2/speculator/{phase}/propose"
+                "vllm:v2/speculator/propose"
             ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -1495,7 +1495,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                 )
             with record_function_or_nullcontext(
-                f"vllm:v2/speculator/{phase}/store_draft_tokens"
+                "vllm:v2/speculator/store_draft_tokens"
             ):
                 if draft_tokens.shape[1] == self.num_speculative_steps:
                     self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -1520,7 +1520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/set_draft_tokens"
+                "vllm:v2/target/set_draft_tokens"
             ):
                 self.draft_tokens_handler.set_draft_tokens(
                     input_batch,
