@@ -116,6 +116,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
