@@ -192,6 +192,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
+        if self.needs_draft_probs and self._last_selected_probs is not None:
+            self._last_selected_probs = self._last_selected_probs[:num_reqs]
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
@@ -243,7 +245,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        self._last_selected_probs = None
         num_reqs = input_batch.num_reqs
+        self._prepare_selected_probs_capture(num_reqs)
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()

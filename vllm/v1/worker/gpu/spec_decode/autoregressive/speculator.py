@@ -161,8 +161,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        self._last_selected_probs = None
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
+        self._prepare_selected_probs_capture(num_reqs)
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(

@@ -327,25 +327,37 @@ class VerifyAdaptiveController:
         self,
         selected_probs: torch.Tensor,  # [B, T] on CPU (pinned), already transferred
         req_ids: list[str],
-        active_draft_req_ids: set[str],
         batch_size: int,
+        active_draft_req_ids: set[str] | None = None,
     ) -> None:
         """Compute and cache adaptive draft_lens from this step's drafter probs."""
         if not self.should_adapt(batch_size):
             return
-        if not active_draft_req_ids or not self._sorted_bs:
+        if not self._sorted_bs:
             return
 
         n_rows = min(selected_probs.shape[0], len(req_ids), batch_size)
-        all_probs_np: np.ndarray = selected_probs[:n_rows].numpy()
-
-        active_indices: list[int] = [
-            i for i in range(n_rows) if req_ids[i] in active_draft_req_ids
-        ]
-        if not active_indices:
+        if n_rows <= 0:
             return
-        active_probs: np.ndarray = all_probs_np[active_indices]
-        active_req_ids: list[str] = [req_ids[i] for i in active_indices]
+
+        if active_draft_req_ids is None:
+            active_probs: np.ndarray = selected_probs[:n_rows].numpy()
+            active_req_ids: list[str] = req_ids[:n_rows]
+        else:
+            if not active_draft_req_ids:
+                return
+            all_probs_np: np.ndarray = selected_probs[:n_rows].numpy()
+            active_indices: list[int] = [
+                i for i in range(n_rows) if req_ids[i] in active_draft_req_ids
+            ]
+            if not active_indices:
+                return
+            if len(active_indices) == n_rows:
+                active_probs = all_probs_np
+                active_req_ids = req_ids[:n_rows]
+            else:
+                active_probs = all_probs_np[active_indices]
+                active_req_ids = [req_ids[i] for i in active_indices]
 
         bs_key = _ceil_lookup(batch_size, self._sorted_bs)
         q_levels = self._sorted_sql_per_bs[bs_key]

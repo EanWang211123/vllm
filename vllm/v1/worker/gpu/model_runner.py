@@ -21,6 +21,7 @@ import functools
 import gc
 import time
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -50,6 +51,8 @@ from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.verify_adaptive_config import VerifyAdaptiveConfig
+from vllm.v1.spec_decode.verify_adaptive_controller import VerifyAdaptiveController
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -200,6 +203,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
                     )
+
+        self._verify_adaptive_controller: VerifyAdaptiveController | None = None
+        self._dummy_profile_seq_lens: int | None = None
+        self._adaptive_probs_pinned: torch.Tensor | None = None
+        self._adaptive_probs_event: torch.cuda.Event | None = None
+        self._adaptive_probs_pending = False
+        self._adaptive_pending_polls = 0
+        self._adaptive_num_reqs = 0
+        self._adaptive_req_ids: list[str] = []
+        adaptive_cfg_str = (
+            self.speculative_config.speculative_adaptive_verify_config
+            if self.speculative_config is not None
+            else None
+        )
+        if adaptive_cfg_str:
+            if self.speculative_config is None:
+                logger.warning(
+                    "adaptive_verify_config is set without speculative config; "
+                    "adaptive verify is disabled."
+                )
+            elif not self.speculative_config.supports_adaptive_verify():
+                logger.warning(
+                    "adaptive_verify_config is set but the speculative method "
+                    "does not support adaptive verifier step-length."
+                )
+            elif self.speculative_config.method != "dflash":
+                logger.warning(
+                    "Model Runner V2 adaptive verify currently supports "
+                    "method=dflash only; adaptive verify is disabled."
+                )
+            elif not self.is_last_pp_rank:
+                logger.warning(
+                    "Adaptive verify is only active on the last PP rank; disabled."
+                )
+            else:
+                config = VerifyAdaptiveConfig.from_json_str(adaptive_cfg_str)
+                self._verify_adaptive_controller = VerifyAdaptiveController(
+                    config=config,
+                    num_spec_tokens=self.speculative_config.num_speculative_tokens,
+                    max_batch_size=self.scheduler_config.max_num_seqs,
+                    device=self.device,
+                )
+                self._adaptive_probs_pinned = torch.empty(
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    dtype=torch.float32,
+                    pin_memory=PIN_MEMORY,
+                )
+                self._adaptive_probs_event = torch.cuda.Event()
+
+        if (
+            self.compilation_config.cudagraph_capture_sizes
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            self.cudagraph_batch_sizes = sorted(
+                self.compilation_config.cudagraph_capture_sizes
+            )
+        else:
+            self.cudagraph_batch_sizes = []
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -510,10 +572,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         num_tokens: int,
         *args,
+        scheduled_tokens: list[int] | None = None,
         skip_attn: bool = False,
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        run_speculator: bool = True,
+        profile_seq_lens: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -522,8 +587,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = min(num_tokens, self.max_num_reqs)
-        if uniform_decode:
+        if scheduled_tokens is not None:
+            num_reqs = len(scheduled_tokens)
+            assert num_reqs > 0
+            num_tokens_per_request = scheduled_tokens
+            num_tokens = int(sum(num_tokens_per_request))
+        else:
+            num_reqs = min(num_tokens, self.max_num_reqs)
+            num_tokens_per_request = [num_tokens // num_reqs] * num_reqs
+            num_tokens_per_request[-1] += num_tokens % num_reqs
+
+        if uniform_decode and scheduled_tokens is None:
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
             # 1+num_speculative_tokens we use max here, this will likely be eventually
@@ -531,8 +605,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens = max(num_tokens, self.decode_query_len)
             num_reqs = num_tokens // self.decode_query_len
             assert num_tokens % self.decode_query_len == 0
-        num_tokens_per_request = [num_tokens // num_reqs] * num_reqs
-        num_tokens_per_request[-1] += num_tokens % num_reqs
+            num_tokens_per_request = [num_tokens // num_reqs] * num_reqs
+            num_tokens_per_request[-1] += num_tokens % num_reqs
 
         assert sum(num_tokens_per_request) == num_tokens
         num_scheduled_tokens = {
@@ -552,21 +626,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         max_loras = self.lora_config.max_loras if self.lora_config is not None else 0
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
-            num_sampled_tokens=None,
-            remove_lora=True,
-            num_active_loras=max_loras,
-        ):
-            # Execute the model.
-            self.execute_model(
-                dummy_scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=True,
-                skip_attn_for_dummy_run=skip_attn,
-                is_profile=is_profile,
-            )
+        self._dummy_profile_seq_lens = profile_seq_lens
+        try:
+            with self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
+                num_sampled_tokens=None,
+                remove_lora=True,
+                num_active_loras=max_loras,
+            ):
+                # Execute the model.
+                self.execute_model(
+                    dummy_scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=True,
+                    skip_attn_for_dummy_run=skip_attn,
+                    is_profile=is_profile,
+                )
+        finally:
+            self._dummy_profile_seq_lens = None
         self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
@@ -582,7 +660,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
-        if self.speculator is not None:
+        if run_speculator and self.speculator is not None:
             assert self.sampler is not None
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -665,6 +743,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         gc.collect()
+
+    def profile_adaptive_cost(self) -> None:
+        if self._verify_adaptive_controller is not None:
+            self._verify_adaptive_controller.profile_cost_table(self)
+            num_entries = len(
+                getattr(self._verify_adaptive_controller, "_cost_table", {})
+            )
+            if num_entries == 0:
+                logger.warning(
+                    "Adaptive verify profiling produced an empty cost table; "
+                    "adaptive verify will stay inactive."
+                )
+
+    @torch.inference_mode()
+    def _adaptive_profile_run(
+        self,
+        scheduled_tokens: list[int],
+        seq_lens: int = 1024,
+        n_warmup: int = 3,
+        n_measure: int = 5,
+    ) -> tuple[str, float, int]:
+        assert scheduled_tokens, "scheduled_tokens must be non-empty."
+        num_reqs = len(scheduled_tokens)
+        num_tokens = int(sum(scheduled_tokens))
+        max_query_len = max(scheduled_tokens)
+        uniform_tok_count = get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+        runtime_mode = CUDAGraphMode.NONE.name.lower()
+        num_tokens_padded = num_tokens
+        if self.cudagraph_manager is not None:
+            batch_desc, _ = dispatch_cg_and_sync_dp(
+                self.cudagraph_manager,
+                num_reqs,
+                num_tokens,
+                uniform_tok_count,
+                self.dp_size,
+                self.dp_rank,
+                num_active_loras=0,
+            )
+            runtime_mode = batch_desc.cg_mode.name.lower()
+            num_tokens_padded = batch_desc.num_tokens
+
+        for _ in range(n_warmup):
+            self._dummy_run(
+                num_tokens,
+                scheduled_tokens=scheduled_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                run_speculator=False,
+                profile_seq_lens=seq_lens,
+            )
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        elapsed_ms: list[float] = []
+        for _ in range(n_measure):
+            start_event.record()
+            self._dummy_run(
+                num_tokens,
+                scheduled_tokens=scheduled_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                run_speculator=False,
+                profile_seq_lens=seq_lens,
+            )
+            end_event.record()
+            end_event.synchronize()
+            elapsed_ms.append(start_event.elapsed_time(end_event))
+
+        avg_ms = float(np.mean(elapsed_ms)) if elapsed_ms else 0.0
+        return runtime_mode, avg_ms, num_tokens_padded
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
@@ -753,6 +902,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
         for req_id in finished_req_ids:
             self._remove_request(req_id)
+            if self._verify_adaptive_controller is not None:
+                self._verify_adaptive_controller.invalidate(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -1097,6 +1248,119 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.model_state.postprocess_state(idx_mapping, num_sampled)
 
+    def _apply_adaptive_verify_truncation(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        ctrl = self._verify_adaptive_controller
+        if ctrl is None or not scheduler_output.scheduled_spec_decode_tokens:
+            return scheduler_output
+
+        batch_size = len(scheduler_output.num_scheduled_tokens)
+        if not ctrl.should_adapt(batch_size):
+            ctrl.clear_cached_draft_lens()
+            return scheduler_output
+
+        new_spec: dict | None = None
+        new_num_sched: dict | None = None
+        tokens_delta = 0
+        for req_id, draft_toks in scheduler_output.scheduled_spec_decode_tokens.items():
+            adaptive_len = ctrl.get_adaptive_draft_len(req_id)
+            if adaptive_len is None or adaptive_len >= len(draft_toks):
+                continue
+            if new_spec is None:
+                new_spec = scheduler_output.scheduled_spec_decode_tokens.copy()
+                new_num_sched = scheduler_output.num_scheduled_tokens.copy()
+            diff = len(draft_toks) - adaptive_len
+            tokens_delta += diff
+            new_num_sched[req_id] -= diff
+            if adaptive_len == 0:
+                del new_spec[req_id]
+            else:
+                new_spec[req_id] = draft_toks[:adaptive_len]
+
+        if tokens_delta == 0:
+            return scheduler_output
+
+        return replace(
+            scheduler_output,
+            scheduled_spec_decode_tokens=new_spec,
+            num_scheduled_tokens=new_num_sched,
+            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens
+            - tokens_delta,
+        )
+
+    def _enqueue_adaptive_selected_probs(self, input_batch: InputBatch) -> None:
+        ctrl = self._verify_adaptive_controller
+        if (
+            ctrl is None
+            or self._adaptive_probs_pending
+            or self._adaptive_probs_pinned is None
+            or self._adaptive_probs_event is None
+            or self.speculator is None
+            or not hasattr(self.speculator, "take_last_selected_probs")
+            or not ctrl.should_adapt(input_batch.num_reqs)
+        ):
+            return
+
+        selected_probs = self.speculator.take_last_selected_probs()
+        if selected_probs is None:
+            logger.warning_once(
+                "Adaptive verify enabled but selected_probs is missing from "
+                "speculator; adaptive runtime updates are skipped."
+            )
+            return
+        num_reqs = input_batch.num_reqs
+        if (
+            selected_probs.ndim != 2
+            or selected_probs.shape[1] != self.num_speculative_steps
+            or selected_probs.shape[0] < num_reqs
+        ):
+            logger.debug(
+                "Skip adaptive selected_probs capture due to shape mismatch: "
+                "got %s, expected at least (%d, %d).",
+                tuple(selected_probs.shape),
+                num_reqs,
+                self.num_speculative_steps,
+            )
+            return
+        selected_probs = selected_probs[:num_reqs]
+
+        self._adaptive_probs_pending = True
+        self._adaptive_pending_polls = 0
+        self._adaptive_num_reqs = num_reqs
+        self._adaptive_req_ids = input_batch.req_ids.copy()
+        self._adaptive_probs_pinned[:num_reqs].copy_(selected_probs, non_blocking=True)
+        self._adaptive_probs_event.record()
+
+    def _maybe_process_adaptive_probs(self) -> None:
+        ctrl = self._verify_adaptive_controller
+        if (
+            ctrl is None
+            or not self._adaptive_probs_pending
+            or self._adaptive_probs_event is None
+            or self._adaptive_probs_pinned is None
+        ):
+            return
+        if not self._adaptive_probs_event.query():
+            self._adaptive_pending_polls += 1
+            if self._adaptive_pending_polls < 16:
+                return
+            logger.warning_once(
+                "Adaptive verify D2H event stayed pending for many steps; "
+                "forcing one synchronize to recover."
+            )
+            self._adaptive_probs_event.synchronize()
+        self._adaptive_pending_polls = 0
+
+        self._adaptive_probs_pending = False
+        num_reqs = self._adaptive_num_reqs
+        if num_reqs > 0:
+            ctrl.process_draft_output(
+                selected_probs=self._adaptive_probs_pinned[:num_reqs],
+                req_ids=self._adaptive_req_ids,
+                batch_size=num_reqs,
+            )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1107,6 +1371,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            self._maybe_process_adaptive_probs()
+            scheduler_output = self._apply_adaptive_verify_truncation(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1175,6 +1441,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
                 self.input_buffers,
+                seq_lens_override=self._dummy_profile_seq_lens,
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
@@ -1428,6 +1695,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if hasattr(self.speculator, "needs_draft_probs"):
+                self.speculator.needs_draft_probs = (
+                    self._verify_adaptive_controller is not None
+                    and self._verify_adaptive_controller.should_adapt(input_batch.num_reqs)
+                )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1451,6 +1723,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            self._enqueue_adaptive_selected_probs(input_batch)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

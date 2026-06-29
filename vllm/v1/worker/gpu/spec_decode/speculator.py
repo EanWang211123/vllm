@@ -131,6 +131,15 @@ class DraftModelSpeculator(BaseSpeculator):
                 dtype=torch.float32,
                 device=device,
             )
+        # Capture selected-token probabilities only when adaptive verify asks for it.
+        self.needs_draft_probs: bool = False
+        self._selected_probs_buffer = torch.zeros(
+            self.max_num_reqs,
+            self.num_speculative_steps,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._last_selected_probs: torch.Tensor | None = None
 
     @abstractmethod
     def load_draft_model(
@@ -222,6 +231,11 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         logits = self.model.compute_logits(hidden_states)
+        if self.needs_draft_probs:
+            draft_tokens = logits.argmax(dim=-1)
+            selected_probs = self._gather_selected_probs(logits, draft_tokens)
+            self._store_selected_probs(selected_probs, idx_mapping, draft_step)
+            return draft_tokens
         if draft_logits is not None:
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
@@ -238,6 +252,42 @@ class DraftModelSpeculator(BaseSpeculator):
             )
         else:
             return logits.argmax(dim=-1)
+
+    @staticmethod
+    def _gather_selected_probs(
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        idx = token_ids.long().unsqueeze(-1)
+        chosen = logits.gather(-1, idx).squeeze(-1)
+        return (chosen - logits.logsumexp(dim=-1)).exp()
+
+    def _prepare_selected_probs_capture(self, num_reqs: int) -> None:
+        if not self.needs_draft_probs:
+            self._last_selected_probs = None
+            return
+        self._selected_probs_buffer[:num_reqs].zero_()
+        self._last_selected_probs = self._selected_probs_buffer[:num_reqs]
+
+    def _store_selected_probs(
+        self,
+        selected_probs: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        draft_step: torch.Tensor,
+    ) -> None:
+        n = selected_probs.shape[0]
+        req_idx = idx_mapping[:n].to(dtype=torch.long)
+        if draft_step.ndim == 0 or draft_step.numel() == 1:
+            step_idx = torch.zeros_like(req_idx) + draft_step.to(dtype=torch.long)
+        else:
+            step_idx = draft_step[:n].to(dtype=torch.long)
+        self._selected_probs_buffer.index_put_(
+            (req_idx, step_idx), selected_probs, accumulate=False
+        )
+        self._last_selected_probs = self._selected_probs_buffer
+
+    def take_last_selected_probs(self) -> torch.Tensor | None:
+        return self._last_selected_probs
 
     def _copy_request_inputs(
         self,

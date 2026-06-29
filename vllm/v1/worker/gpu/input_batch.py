@@ -99,7 +99,9 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        seq_lens_override: int | None = None,
     ) -> "InputBatch":
+        """Dummy batch for warmup/profiling. ``seq_lens_override`` sets KV length."""
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
 
@@ -113,20 +115,37 @@ class InputBatch:
         num_scheduled_tokens[-1] += num_tokens % num_reqs
         assert int(num_scheduled_tokens.sum()) == num_tokens
 
-        # seq_len equals to query_len
-        input_buffers.seq_lens[:num_reqs] = num_tokens // num_reqs
-        input_buffers.seq_lens[num_reqs - 1] += num_tokens % num_reqs
-        # Pad for full CUDA graph mode.
-        input_buffers.seq_lens[num_reqs:] = 0
-        seq_lens = input_buffers.seq_lens[:num_reqs]
-
         query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
-        input_buffers.query_start_loc[:1] = 0
-        torch.cumsum(
-            seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
-        )
+
+        if seq_lens_override is None:
+            # seq_len equals to query_len
+            input_buffers.seq_lens[:num_reqs] = num_tokens // num_reqs
+            input_buffers.seq_lens[num_reqs - 1] += num_tokens % num_reqs
+            # Pad for full CUDA graph mode.
+            input_buffers.seq_lens[num_reqs:] = 0
+            seq_lens = input_buffers.seq_lens[:num_reqs]
+
+            input_buffers.query_start_loc[:1] = 0
+            torch.cumsum(
+                seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
+            )
+            seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        else:
+            ctx = max(int(seq_lens_override), int(num_scheduled_tokens.max()))
+            input_buffers.seq_lens[:num_reqs] = ctx
+            # Pad for full CUDA graph mode.
+            input_buffers.seq_lens[num_reqs:] = 0
+            seq_lens = input_buffers.seq_lens[:num_reqs]
+
+            input_buffers.query_start_loc[: num_reqs + 1].copy_(
+                torch.from_numpy(query_start_loc_np)
+            )
+            seq_lens_cpu_upper_bound = torch.full(
+                (num_reqs,), ctx, dtype=torch.int32
+            )
+
         # Pad for full CUDA graph mode.
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
@@ -137,8 +156,6 @@ class InputBatch:
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-        # Dummy: seq_len == query_len (fresh-prefill shape).
-        seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
