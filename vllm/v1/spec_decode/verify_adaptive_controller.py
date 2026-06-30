@@ -330,34 +330,30 @@ class VerifyAdaptiveController:
         batch_size: int,
         active_draft_req_ids: set[str] | None = None,
     ) -> None:
-        """Compute and cache adaptive draft_lens from this step's drafter probs."""
-        if not self.should_adapt(batch_size):
-            return
-        if not self._sorted_bs:
+        """Compute and cache adaptive draft_lens from this step's drafter probs.
+
+        ``active_draft_req_ids=None`` means *all* rows are active and takes a
+        zero-copy fast path (no set membership filter / fancy-index copy).
+        """
+        if not self.should_adapt(batch_size) or not self._sorted_bs:
             return
 
         n_rows = min(selected_probs.shape[0], len(req_ids), batch_size)
         if n_rows <= 0:
             return
+        all_probs_np: np.ndarray = selected_probs[:n_rows].numpy()
 
         if active_draft_req_ids is None:
-            active_probs: np.ndarray = selected_probs[:n_rows].numpy()
+            active_probs: np.ndarray = all_probs_np
             active_req_ids: list[str] = req_ids[:n_rows]
         else:
-            if not active_draft_req_ids:
-                return
-            all_probs_np: np.ndarray = selected_probs[:n_rows].numpy()
             active_indices: list[int] = [
                 i for i in range(n_rows) if req_ids[i] in active_draft_req_ids
             ]
             if not active_indices:
                 return
-            if len(active_indices) == n_rows:
-                active_probs = all_probs_np
-                active_req_ids = req_ids[:n_rows]
-            else:
-                active_probs = all_probs_np[active_indices]
-                active_req_ids = [req_ids[i] for i in active_indices]
+            active_probs = all_probs_np[active_indices]
+            active_req_ids = [req_ids[i] for i in active_indices]
 
         bs_key = _ceil_lookup(batch_size, self._sorted_bs)
         q_levels = self._sorted_sql_per_bs[bs_key]
@@ -374,6 +370,9 @@ class VerifyAdaptiveController:
         for req_id, draft_len in zip(active_req_ids, draft_lens):
             self._adaptive_draft_lens[req_id] = draft_len
 
+        # Hot path: runs every decode step. Keep at debug level (set the logger
+        # to DEBUG to observe per-step decisions) to avoid per-step string
+        # formatting / I/O on the critical path between forward passes.
         logger.debug(
             "adaptive: bs_key=%d best_Q=%d best_S=%d score=%.4f draft_lens=%s",
             bs_key, result["best_Q"], result["best_S"],

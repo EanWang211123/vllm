@@ -209,7 +209,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._adaptive_probs_pinned: torch.Tensor | None = None
         self._adaptive_probs_event: torch.cuda.Event | None = None
         self._adaptive_probs_pending = False
-        self._adaptive_pending_polls = 0
         self._adaptive_num_reqs = 0
         self._adaptive_req_ids: list[str] = []
         adaptive_cfg_str = (
@@ -252,6 +251,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     pin_memory=PIN_MEMORY,
                 )
                 self._adaptive_probs_event = torch.cuda.Event()
+                # Enable draft-prob capture *before* CUDA-graph capture so the
+                # gather/store is baked into the (FULL) draft graph and always
+                # refreshes the fixed prob buffer at replay. Toggling this per
+                # step would have no effect on an already-captured graph.
+                if self.speculator is not None and hasattr(
+                    self.speculator, "needs_draft_probs"
+                ):
+                    self.speculator.needs_draft_probs = True
 
         if (
             self.compilation_config.cudagraph_capture_sizes
@@ -785,34 +792,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             runtime_mode = batch_desc.cg_mode.name.lower()
             num_tokens_padded = batch_desc.num_tokens
 
+        # NOTE: is_profile=False so the verifier forward is dispatched to its
+        # real CUDA-graph mode (piecewise/full) instead of being forced eager
+        # (`need_eager=is_profile`). Otherwise the measured latency reflects
+        # eager Python overhead, not the graphed decode latency used at serving.
         for _ in range(n_warmup):
             self._dummy_run(
                 num_tokens,
                 scheduled_tokens=scheduled_tokens,
                 skip_eplb=True,
-                is_profile=True,
+                is_profile=False,
                 run_speculator=False,
                 profile_seq_lens=seq_lens,
             )
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        elapsed_ms: list[float] = []
-        for _ in range(n_measure):
+        avg_ms = 0.0
+        if n_measure > 0:
+            # Time the whole measure loop with a single sync (matches MRv1 and
+            # avoids per-iteration synchronize overhead inflating the estimate).
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-            self._dummy_run(
-                num_tokens,
-                scheduled_tokens=scheduled_tokens,
-                skip_eplb=True,
-                is_profile=True,
-                run_speculator=False,
-                profile_seq_lens=seq_lens,
-            )
+            for _ in range(n_measure):
+                self._dummy_run(
+                    num_tokens,
+                    scheduled_tokens=scheduled_tokens,
+                    skip_eplb=True,
+                    is_profile=False,
+                    run_speculator=False,
+                    profile_seq_lens=seq_lens,
+                )
             end_event.record()
             end_event.synchronize()
-            elapsed_ms.append(start_event.elapsed_time(end_event))
-
-        avg_ms = float(np.mean(elapsed_ms)) if elapsed_ms else 0.0
+            avg_ms = start_event.elapsed_time(end_event) / n_measure
         return runtime_mode, avg_ms, num_tokens_padded
 
     def post_kv_cache_wake_up(self) -> None:
@@ -1260,16 +1272,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ctrl.clear_cached_draft_lens()
             return scheduler_output
 
-        new_spec: dict | None = None
-        new_num_sched: dict | None = None
+        new_spec = scheduler_output.scheduled_spec_decode_tokens.copy()
+        new_num_sched = scheduler_output.num_scheduled_tokens.copy()
         tokens_delta = 0
-        for req_id, draft_toks in scheduler_output.scheduled_spec_decode_tokens.items():
+        for req_id, draft_toks in list(new_spec.items()):
             adaptive_len = ctrl.get_adaptive_draft_len(req_id)
             if adaptive_len is None or adaptive_len >= len(draft_toks):
                 continue
-            if new_spec is None:
-                new_spec = scheduler_output.scheduled_spec_decode_tokens.copy()
-                new_num_sched = scheduler_output.num_scheduled_tokens.copy()
             diff = len(draft_toks) - adaptive_len
             tokens_delta += diff
             new_num_sched[req_id] -= diff
@@ -1326,9 +1335,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         selected_probs = selected_probs[:num_reqs]
 
         self._adaptive_probs_pending = True
-        self._adaptive_pending_polls = 0
         self._adaptive_num_reqs = num_reqs
         self._adaptive_req_ids = input_batch.req_ids.copy()
+        # NOTE: all rows are treated as active; scheduler-side truncation decides
+        # where adaptive draft lengths are actually consumed. process_draft_output
+        # is called with active_draft_req_ids=None (zero-copy fast path).
         self._adaptive_probs_pinned[:num_reqs].copy_(selected_probs, non_blocking=True)
         self._adaptive_probs_event.record()
 
@@ -1341,24 +1352,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or self._adaptive_probs_pinned is None
         ):
             return
-        if not self._adaptive_probs_event.query():
-            self._adaptive_pending_polls += 1
-            if self._adaptive_pending_polls < 16:
-                return
-            logger.warning_once(
-                "Adaptive verify D2H event stayed pending for many steps; "
-                "forcing one synchronize to recover."
-            )
-            self._adaptive_probs_event.synchronize()
-        self._adaptive_pending_polls = 0
+        # TP correctness: the decision to consume this step's draft probs (and
+        # thus which `draft_lens` truncate the *next* schedule) MUST be identical
+        # across all TP ranks. `event.query()` is timing-dependent and can return
+        # True on one rank but False on another at the same scheduler step, making
+        # ranks truncate `scheduled_spec_decode_tokens` differently -> mismatched
+        # forward shapes -> NCCL collective deadlock. So we synchronize
+        # deterministically instead of polling. The D2H is a tiny [num_reqs, S]
+        # tensor whose copy was launched a full step earlier, so this sync is
+        # effectively free (the event is already signaled by now).
+        self._adaptive_probs_event.synchronize()
 
         self._adaptive_probs_pending = False
         num_reqs = self._adaptive_num_reqs
         if num_reqs > 0:
+            # All rows are active in MRv2 (truncation decides where draft lengths
+            # are actually consumed), so pass None for the zero-copy fast path.
             ctrl.process_draft_output(
                 selected_probs=self._adaptive_probs_pinned[:num_reqs],
                 req_ids=self._adaptive_req_ids,
                 batch_size=num_reqs,
+                active_draft_req_ids=None,
             )
 
     @torch.inference_mode()
@@ -1695,11 +1709,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
-            if hasattr(self.speculator, "needs_draft_probs"):
-                self.speculator.needs_draft_probs = (
-                    self._verify_adaptive_controller is not None
-                    and self._verify_adaptive_controller.should_adapt(input_batch.num_reqs)
-                )
+            # NOTE: `needs_draft_probs` is fixed at init (before CUDA-graph
+            # capture) when adaptive verify is enabled, NOT toggled per step:
+            # the prob gather/store is captured into the (FULL) draft graph and
+            # cannot be switched on/off at replay time. The controller decides
+            # per step whether to *consume* the probs instead.
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;

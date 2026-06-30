@@ -231,15 +231,10 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         logits = self.model.compute_logits(hidden_states)
-        if self.needs_draft_probs:
-            draft_tokens = logits.argmax(dim=-1)
-            selected_probs = self._gather_selected_probs(logits, draft_tokens)
-            self._store_selected_probs(selected_probs, idx_mapping, draft_step)
-            return draft_tokens
         if draft_logits is not None:
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
-            return gumbel_sample(
+            draft_tokens = gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
@@ -251,7 +246,14 @@ class DraftModelSpeculator(BaseSpeculator):
                 use_fp64=self.use_fp64_gumbel,
             )
         else:
-            return logits.argmax(dim=-1)
+            draft_tokens = logits.argmax(dim=-1)
+        if self.needs_draft_probs:
+            # Capture the accept-prob proxy of the *actually sampled* draft token
+            # (adaptive verifier). Done in addition to — not instead of — the
+            # normal sampling so the draft distribution is unchanged.
+            selected_probs = self._gather_selected_probs(logits, draft_tokens)
+            self._store_selected_probs(selected_probs, idx_mapping, draft_step)
+        return draft_tokens
 
     @staticmethod
     def _gather_selected_probs(
@@ -275,16 +277,19 @@ class DraftModelSpeculator(BaseSpeculator):
         idx_mapping: torch.Tensor,
         draft_step: torch.Tensor,
     ) -> None:
+        # ``selected_probs`` is laid out request-major: row ``r*num_steps + s``
+        # holds step ``s`` of batch request ``r`` (see dflash ``sample_col`` /
+        # ``sample_indices``). Reshaping therefore yields batch order directly,
+        # so the buffer stays aligned with ``input_batch.req_ids`` without any
+        # req-state-slot scatter. Writing into the fixed buffer with a plain
+        # contiguous copy is also CUDA-graph safe (stable address, no
+        # data-dependent indices), so it can be captured into the FULL graph.
         n = selected_probs.shape[0]
-        req_idx = idx_mapping[:n].to(dtype=torch.long)
-        if draft_step.ndim == 0 or draft_step.numel() == 1:
-            step_idx = torch.zeros_like(req_idx) + draft_step.to(dtype=torch.long)
-        else:
-            step_idx = draft_step[:n].to(dtype=torch.long)
-        self._selected_probs_buffer.index_put_(
-            (req_idx, step_idx), selected_probs, accumulate=False
+        num_reqs = n // self.num_speculative_steps
+        self._selected_probs_buffer[:num_reqs].copy_(
+            selected_probs.reshape(num_reqs, self.num_speculative_steps)
         )
-        self._last_selected_probs = self._selected_probs_buffer
+        self._last_selected_probs = self._selected_probs_buffer[:num_reqs]
 
     def take_last_selected_probs(self) -> torch.Tensor | None:
         return self._last_selected_probs

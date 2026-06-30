@@ -192,8 +192,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
-        if self.needs_draft_probs and self._last_selected_probs is not None:
-            self._last_selected_probs = self._last_selected_probs[:num_reqs]
+        # NOTE: selected_probs are written into the fixed `_selected_probs_buffer`
+        # (batch order) by `_store_selected_probs`; `propose` slices it to the
+        # live `num_reqs` after the draft (works for both FULL-graph replay and
+        # the eager path).
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
@@ -370,6 +372,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+
+        # `_store_selected_probs` (captured into the FULL graph or run eagerly)
+        # always refreshes `_selected_probs_buffer` in batch order. Slice it to
+        # the live request count so downstream sees exactly this step's probs.
+        if self.needs_draft_probs:
+            self._last_selected_probs = self._selected_probs_buffer[:num_reqs]
+        else:
+            self._last_selected_probs = None
 
         return self.draft_tokens[:num_reqs]
 
