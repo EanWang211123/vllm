@@ -1156,8 +1156,10 @@ class SpeculativeConfig:
 
     def supports_adaptive_verify(self) -> bool:
         """Whether adaptive verifier step-length is supported."""
-        return self.use_dflash() or (
-            self.uses_draft_model() and self.parallel_drafting
+        return (
+            self.use_dflash()
+            or self.use_dspark()
+            or (self.uses_draft_model() and self.parallel_drafting)
         )
 
     def use_dspark(self) -> bool:

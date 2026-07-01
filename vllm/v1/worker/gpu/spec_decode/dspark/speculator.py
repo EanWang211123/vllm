@@ -140,6 +140,12 @@ class DSparkSpeculator(DFlashSpeculator):
             device=self.device,
         )
 
+    @property
+    def _has_confidence_head(self) -> bool:
+        # DSV4 DSpark always has it; Qwen3 DSpark only with enable_confidence_head.
+        inner = getattr(self.model, "model", None)
+        return getattr(inner, "confidence_head", None) is not None
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
@@ -152,6 +158,16 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+
+        # Adaptive verify: capture the per-position accept prob for each draft
+        # step (decided before CUDA-graph capture, so the branch bakes into the
+        # FULL graph). The confidence head — when present — directly predicts the
+        # conditional per-step accept prob (a trained signal); otherwise fall back
+        # to the draft-token softmax proxy (mirroring DFlash's sample_draft).
+        capture_probs = self.needs_draft_probs
+        use_confidence = capture_probs and self._has_confidence_head
+        if use_confidence:
+            sample_hidden_r = sample_hidden.view(num_reqs, n_spec, -1)
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -180,6 +196,17 @@ class DSparkSpeculator(DFlashSpeculator):
             else:
                 draft_i = logits_i.argmax(dim=-1)
             self.draft_tokens[:num_reqs, i] = draft_i
+            if capture_probs:
+                if use_confidence:
+                    # markov_embed is W1[x_{k-1}]; sample_hidden_r[:, i] is h_k.
+                    score = self.model.compute_confidence(
+                        sample_hidden_r[:, i], markov_embed
+                    )
+                    self._selected_probs_buffer[:num_reqs, i] = torch.sigmoid(score)
+                else:
+                    self._selected_probs_buffer[:num_reqs, i] = (
+                        self._gather_selected_probs(logits_i, draft_i)
+                    )
             prev = draft_i
 
     def _generate_draft(
@@ -333,6 +360,13 @@ class DSparkSpeculator(DFlashSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+
+        # Publish this step's captured accept probs (batch order) for the adaptive
+        # verifier; the buffer was filled in _sample_sequential. Mirrors DFlash.
+        if self.needs_draft_probs:
+            self._last_selected_probs = self._selected_probs_buffer[:num_reqs]
+        else:
+            self._last_selected_probs = None
 
         return self.draft_tokens[:num_reqs]
 

@@ -228,10 +228,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "adaptive_verify_config is set but the speculative method "
                     "does not support adaptive verifier step-length."
                 )
-            elif self.speculative_config.method != "dflash":
+            elif self.speculative_config.method not in ("dflash", "dspark"):
                 logger.warning(
                     "Model Runner V2 adaptive verify currently supports "
-                    "method=dflash only; adaptive verify is disabled."
+                    "method in {dflash, dspark} only; adaptive verify is disabled."
                 )
             elif not self.is_last_pp_rank:
                 logger.warning(
