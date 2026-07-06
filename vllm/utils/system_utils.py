@@ -316,9 +316,13 @@ def find_loaded_library(lib_name: str) -> str | None:
     found_line = None
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
-                found_line = line
-                break
+            if lib_name not in line:
+                continue
+            # TileLang ships libcudart_stub.so without full CUDA runtime symbols.
+            if "_stub" in line:
+                continue
+            found_line = line
+            break
     if found_line is None:
         # the library is not loaded in the current process
         return None

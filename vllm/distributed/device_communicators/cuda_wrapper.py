@@ -104,11 +104,8 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: str | None = None):
         if so_file is None:
-            so_file = (
-                find_loaded_library(
-                    "libamdhip64" if current_platform.is_rocm() else "libcudart"
-                )
-                or envs.VLLM_CUDART_SO_PATH  # fallback to env var
+            so_file = envs.VLLM_CUDART_SO_PATH or find_loaded_library(
+                "libamdhip64" if current_platform.is_rocm() else "libcudart"
             )
             assert so_file is not None, (
                 "libcudart is not loaded in the current process, "
