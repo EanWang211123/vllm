@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    get_kv_quant_mode,
 )
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
@@ -87,6 +88,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else None,
