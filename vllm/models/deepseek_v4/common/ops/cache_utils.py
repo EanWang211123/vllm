@@ -21,7 +21,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
 
 
 @triton.jit
@@ -400,17 +399,11 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
-        # lazily import, otherwise some tests fail due to CUDA driver init failure.
-        from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
-            dequantize_and_gather_k_cache_cutedsl,
-        )
-
-        dequantize_and_gather_k_cache_cutedsl(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-        )
-        return
-
+    # CuTe DSL dequant assumes a fixed [*, block_size, 584] layout with
+    # block-major strides. C4A compressed pages (storage_block_size=64) and
+    # 576B-aligned padding disagree with that compile-time shape, causing
+    # "Mismatched k_cache.shape[2]" at warmup. Triton reads block_stride from
+    # the actual KV tensor and matches the paged fp8_ds_mla layout.
     dequantize_and_gather_k_cache_triton(
         out,
         k_cache,
