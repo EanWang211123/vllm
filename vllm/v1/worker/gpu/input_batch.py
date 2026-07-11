@@ -58,6 +58,8 @@ class InputBatch:
     num_draft_tokens: int
     # [num_reqs] number of draft tokens scheduled for each request, if any.
     num_draft_tokens_per_req: np.ndarray | None
+    # Number of draft tokens to generate for the next step.
+    num_spec_tokens_to_schedule: int
 
     # [num_reqs + 1]
     query_start_loc: torch.Tensor
@@ -105,6 +107,7 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        num_spec_tokens_to_schedule: int = 0,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
@@ -161,6 +164,7 @@ class InputBatch:
             num_tokens_after_padding=num_tokens,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
