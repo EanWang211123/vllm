@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from importlib.util import find_spec
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,10 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.vocab_mapping import VocabMapping
+
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -24,6 +28,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
@@ -124,6 +129,11 @@ class SpecDecodeBaseProposer:
             self.speculative_config.use_local_argmax_reduction
         )
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+
+        self.use_heterogeneous_vocab: bool = (
+            self.speculative_config.use_heterogeneous_vocab
+        )
+        self.vocab_mapping: VocabMapping | None = None
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -425,6 +435,12 @@ class SpecDecodeBaseProposer:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
+        if self.use_heterogeneous_vocab:
+            logits = self.model.compute_logits(hidden_states)
+            assert self.vocab_mapping is not None
+            logits = self.vocab_mapping.constrain_draft_logits(logits)
+            draft_token_ids = logits.argmax(dim=-1)
+            return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
     def _sample_from_logits(
@@ -478,18 +494,37 @@ class SpecDecodeBaseProposer:
             return self._greedy_sample(hidden_states), None, None
 
         logits = self.model.compute_logits(hidden_states)
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            logits = self.vocab_mapping.constrain_draft_logits(logits)
         if need_full:
-            token_ids, full_probs = compute_probs_and_sample_next_token(
+            token_ids, full_probs = self._sample_from_logits(
                 logits, sampling_metadata
             )
         else:
             token_ids, full_probs = logits.argmax(dim=-1), None
 
+        # Compute selected_probs before vocab remapping so we gather from
+        # draft-vocab logits against draft-vocab token indices.
         selected_probs = (
             self._gather_selected_probs(logits, token_ids, full_probs)
             if self.needs_draft_probs
             else None
         )
+
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            token_ids = self.vocab_mapping.map_draft_to_target_ids(token_ids)
+            # Config validation ensures draft_sample_method == "greedy" when
+            # use_heterogeneous_vocab is True, so this branch should never be
+            # reached. Kept as a safety fallback until probabilistic rejection
+            # sampling with heterogeneous vocabularies is implemented.
+            # TODO: remap full_probs to target-vocab space for lossless
+            # probabilistic rejection sampling with heterogeneous vocabularies.
+            assert full_probs is None, (
+                "probabilistic draft sampling is not supported with "
+                "use_heterogeneous_vocab"
+            )
         return token_ids, full_probs, selected_probs
 
     @staticmethod
@@ -552,6 +587,7 @@ class SpecDecodeBaseProposer:
                     Eagle3DeepseekV2ForCausalLM,
                     DFlashQwen3ForCausalLM,
                     Eagle3Qwen3ForCausalLM,
+                    DFlashLagunaForCausalLM,
                 ),
             )
             target_hidden_states = self.model.combine_hidden_states(
@@ -615,6 +651,9 @@ class SpecDecodeBaseProposer:
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(True)
+            # The topk indices were written for each query token in the multi-token
+            # batch. Compact the topk indices for each request's last token.
+            self.model.model.compact_topk_indices(token_indices_to_sample)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
@@ -703,6 +742,11 @@ class SpecDecodeBaseProposer:
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
+
+            if self.use_heterogeneous_vocab:
+                # Map target token IDs to draft vocab space (TLI algorithm)
+                assert self.vocab_mapping is not None
+                input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
             if not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(
@@ -849,6 +893,13 @@ class SpecDecodeBaseProposer:
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        # Map target token IDs to draft vocab space (TLI algorithm)
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            target_token_ids = self.vocab_mapping.map_target_to_draft_ids(
+                target_token_ids
+            )
+            next_token_ids = self.vocab_mapping.map_target_to_draft_ids(next_token_ids)
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,
@@ -1314,6 +1365,15 @@ class SpecDecodeBaseProposer:
             ),
         )
 
+        if spec_cfg.kv_cache_dtype is not None:
+            base = replace(
+                base,
+                cache_config=replace(
+                    base.cache_config,
+                    cache_dtype=spec_cfg.kv_cache_dtype,
+                ),
+            )
+
         return base
 
     def _get_model(self) -> nn.Module:
@@ -1481,6 +1541,26 @@ class SpecDecodeBaseProposer:
                     "Detected MTP model. "
                     "Sharing target model embedding weights with the draft model."
                 )
+
+            if share_embeddings:
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+                # are not affected — mirrors the weight-equality check above.
+                if isinstance(target_embed_tokens.weight, torch.Tensor) and isinstance(
+                    draft_embed.weight, torch.Tensor
+                ):
+                    target_dim = target_embed_tokens.weight.shape[-1]
+                    draft_dim = draft_embed.weight.shape[-1]
+                    if target_dim != draft_dim:
+                        share_embeddings = False
+                        logger.info(
+                            "Target embedding dim (%d) differs from draft "
+                            "embedding dim (%d). Keeping separate embedding "
+                            "weights.",
+                            target_dim,
+                            draft_dim,
+                        )
 
             if share_embeddings:
                 if hasattr(self.model.model, "embed_tokens"):

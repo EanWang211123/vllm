@@ -347,7 +347,11 @@ def test_selective_state_update(dim, dstate, has_z, itype):
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
-        if torch.version.hip:
+        if (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(90)
+        ):
             atol *= 2
     # set seed
     set_random_seed(0)
@@ -437,7 +441,7 @@ def test_selective_state_update_varlen(dim, dstate, has_z, itype, max_seq_len):
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 5e-2, 1.5e-1
-        if torch.version.hip:
+        if current_platform.is_rocm() or current_platform.is_xpu():
             atol *= 2
     # set seed
     set_random_seed(0)
@@ -700,7 +704,7 @@ def test_selective_state_update_with_batch_indices(
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 1e-1, 1e-1
-        if torch.version.hip:
+        if current_platform.is_rocm() or current_platform.is_xpu():
             atol *= 2
     # set seed
     torch.random.manual_seed(0)
@@ -865,7 +869,7 @@ def test_selective_state_update_with_num_accepted_tokens(
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 5e-2, 1.5e-1
-        if torch.version.hip:
+        if current_platform.is_rocm() or current_platform.is_xpu():
             atol *= 2
 
     set_random_seed(0)
@@ -991,7 +995,7 @@ def test_selective_state_update_varlen_with_num_accepted(
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 5e-2, 1.5e-1
-        if torch.version.hip:
+        if current_platform.is_rocm() or current_platform.is_xpu():
             atol *= 2
 
     set_random_seed(0)
