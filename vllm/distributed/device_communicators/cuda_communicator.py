@@ -8,6 +8,10 @@ from torch.distributed import ProcessGroup
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.kernel import (
+    FLASHINFER_MOE_EP_BACKENDS,
+    PASSTHROUGH_ALL2ALL_BACKEND,
+)
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_ag_rs,
@@ -290,12 +294,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import FlashInferNVLinkOneSidedManager
 
                 self.all2all_manager = FlashInferNVLinkOneSidedManager(self.cpu_group)
-            elif self.all2all_backend == "passthrough":
-                from .all2all import PassThroughAll2AllManager
+            elif self.all2all_backend == PASSTHROUGH_ALL2ALL_BACKEND:
+                from .all2all import AgRsAll2AllManager, PassThroughAll2AllManager
 
-                self.all2all_manager = PassThroughAll2AllManager(
-                    self.cpu_group, tcp_store_group
+                spec = config.speculative_config if config is not None else None
+                # Target experts keep their own dispatch/combine. Provide EP
+                # collectives for a regular draft that uses the same group.
+                manager_cls = (
+                    AgRsAll2AllManager
+                    if config is not None
+                    and spec is not None
+                    and spec.moe_backend is not None
+                    and spec.moe_backend not in FLASHINFER_MOE_EP_BACKENDS
+                    and config.kernel_config.moe_backend in FLASHINFER_MOE_EP_BACKENDS
+                    else PassThroughAll2AllManager
                 )
+                self.all2all_manager = manager_cls(self.cpu_group, tcp_store_group)
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 
